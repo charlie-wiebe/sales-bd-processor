@@ -7,6 +7,7 @@ from typing import List
 import io
 import tempfile
 import base64
+import csv
 
 app = Flask(__name__)
 
@@ -99,6 +100,7 @@ HTML_TEMPLATE = """
         .results { margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 4px; }
         .progress { margin: 10px 0; }
         .status { font-family: monospace; white-space: pre-wrap; }
+        .example { background: #e9ecef; padding: 10px; border-radius: 4px; margin: 10px 0; font-family: monospace; }
     </style>
 </head>
 <body>
@@ -107,12 +109,34 @@ HTML_TEMPLATE = """
     
     <form id="processForm">
         <div class="form-group">
-            <label>Company Slugs (one per line):</label>
-            <textarea id="companies" placeholder="nooksapp
-hubspot
-salesforce
-..."></textarea>
+            <label>Input Format (choose one):</label>
+            <div>
+                <input type="radio" id="slugsOnly" name="inputFormat" value="slugs" checked>
+                <label for="slugsOnly">Company slugs only (one per line)</label>
+            </div>
+            <div>
+                <input type="radio" id="csvFormat" name="inputFormat" value="csv">
+                <label for="csvFormat">CSV format: hubspot_company_id,slug</label>
+            </div>
         </div>
+        
+        <div class="form-group">
+            <label>Company Data:</label>
+            <div class="example" id="slugExample">
+                Example (slugs only):
+                nooksapp
+                hubspot
+                salesforce
+            </div>
+            <div class="example" id="csvExample" style="display:none;">
+                Example (CSV format):
+                12345,nooksapp
+                67890,hubspot
+                11111,salesforce
+            </div>
+            <textarea id="companies" placeholder="Enter your company data here..."></textarea>
+        </div>
+        
         <div class="form-group">
             <label>Batch Size:</label>
             <input type="number" id="batchSize" value="1000" min="100" max="5000">
@@ -129,14 +153,46 @@ salesforce
     </div>
 
     <script>
+        // Toggle examples based on input format
+        document.querySelectorAll('input[name="inputFormat"]').forEach(radio => {
+            radio.addEventListener('change', function() {
+                if (this.value === 'slugs') {
+                    document.getElementById('slugExample').style.display = 'block';
+                    document.getElementById('csvExample').style.display = 'none';
+                    document.getElementById('companies').placeholder = 'nooksapp\\nhubspot\\nsalesforce\\n...';
+                } else {
+                    document.getElementById('slugExample').style.display = 'none';
+                    document.getElementById('csvExample').style.display = 'block';
+                    document.getElementById('companies').placeholder = '12345,nooksapp\\n67890,hubspot\\n11111,salesforce\\n...';
+                }
+            });
+        });
+        
         document.getElementById('processForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             
-            const companies = document.getElementById('companies').value.trim().split('\\n').filter(c => c.trim());
+            const inputFormat = document.querySelector('input[name="inputFormat"]:checked').value;
+            const inputData = document.getElementById('companies').value.trim();
             const batchSize = parseInt(document.getElementById('batchSize').value);
             
+            if (!inputData) {
+                alert('Please enter company data');
+                return;
+            }
+            
+            // Parse input based on format
+            let companies = [];
+            if (inputFormat === 'slugs') {
+                companies = inputData.split('\\n').filter(line => line.trim()).map(slug => ({slug: slug.trim()}));
+            } else {
+                companies = inputData.split('\\n').filter(line => line.trim()).map(line => {
+                    const [hubspot_id, slug] = line.split(',').map(s => s.trim());
+                    return {hubspot_company_id: hubspot_id, slug: slug};
+                });
+            }
+            
             if (companies.length === 0) {
-                alert('Please enter company slugs');
+                alert('No valid company data found');
                 return;
             }
             
@@ -147,7 +203,7 @@ salesforce
                 const response = await fetch('/process', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ companies, batch_size: batchSize })
+                    body: JSON.stringify({ companies, batch_size: batchSize, input_format: inputFormat })
                 });
                 
                 const result = await response.json();
@@ -189,11 +245,18 @@ def test_connection():
 def process_companies():
     try:
         data = request.json
-        companies = data['companies']
+        companies = data['companies']  # List of {slug: "...", hubspot_company_id: "..."} or {slug: "..."}
         batch_size = data.get('batch_size', 1000)
+        input_format = data.get('input_format', 'slugs')
         
         db_config = get_db_config()
         all_results = []
+        
+        # Create lookup dict for HubSpot IDs if provided
+        slug_to_hubspot_id = {}
+        if input_format == 'csv':
+            for company in companies:
+                slug_to_hubspot_id[company['slug']] = company['hubspot_company_id']
         
         # Process in batches
         for i in range(0, len(companies), batch_size):
@@ -203,14 +266,21 @@ def process_companies():
             
             print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} companies)")
             
-            # Format for SQL IN clause
-            slug_list = "'" + "', '".join(batch) + "'"
+            # Format for SQL IN clause - just the slugs
+            slug_list = "'" + "', '".join([company['slug'] for company in batch]) + "'"
             query = QUERY_TEMPLATE.format(slug_list)
             
             # Execute query
             try:
                 conn = psycopg2.connect(**db_config)
                 df = pd.read_sql(query, conn)
+                
+                # Add HubSpot company IDs if provided
+                if input_format == 'csv':
+                    df['hubspot_company_id'] = df['slug'].map(slug_to_hubspot_id)
+                    # Reorder columns to put hubspot_company_id first
+                    df = df[['hubspot_company_id', 'slug', 'sales_bd_count']]
+                
                 all_results.append(df)
                 conn.close()
                 
