@@ -5,17 +5,55 @@ import time
 from flask import Flask, request, jsonify, render_template_string
 from typing import List
 import io
+import tempfile
+import base64
 
 app = Flask(__name__)
 
+def setup_ssl_files():
+    """Setup SSL certificate files from environment variables"""
+    ssl_files = {}
+    
+    # Check if SSL certs are provided as base64 encoded strings
+    if os.getenv('DB_SSL_ROOT_CERT'):
+        root_cert_file = tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False)
+        root_cert_file.write(base64.b64decode(os.getenv('DB_SSL_ROOT_CERT')).decode('utf-8'))
+        root_cert_file.close()
+        ssl_files['sslrootcert'] = root_cert_file.name
+    
+    if os.getenv('DB_SSL_CLIENT_CERT'):
+        client_cert_file = tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False)
+        client_cert_file.write(base64.b64decode(os.getenv('DB_SSL_CLIENT_CERT')).decode('utf-8'))
+        client_cert_file.close()
+        ssl_files['sslcert'] = client_cert_file.name
+    
+    if os.getenv('DB_SSL_CLIENT_KEY'):
+        client_key_file = tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False)
+        client_key_file.write(base64.b64decode(os.getenv('DB_SSL_CLIENT_KEY')).decode('utf-8'))
+        client_key_file.close()
+        ssl_files['sslkey'] = client_key_file.name
+    
+    return ssl_files
+
 # Database configuration from environment
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST'),
-    'database': os.getenv('DB_NAME'),
-    'user': os.getenv('DB_USER'),
-    'password': os.getenv('DB_PASSWORD'),
-    'port': int(os.getenv('DB_PORT', 5432))
-}
+def get_db_config():
+    config = {
+        'host': os.getenv('DB_HOST'),
+        'database': os.getenv('DB_NAME'),
+        'user': os.getenv('DB_USER'),
+        'password': os.getenv('DB_PASSWORD'),
+        'port': int(os.getenv('DB_PORT', 5432))
+    }
+    
+    # Add SSL configuration
+    ssl_mode = os.getenv('DB_SSL_MODE', 'prefer')  # prefer, require, verify-ca, verify-full
+    config['sslmode'] = ssl_mode
+    
+    if ssl_mode in ['verify-ca', 'verify-full']:
+        ssl_files = setup_ssl_files()
+        config.update(ssl_files)
+    
+    return config
 
 QUERY_TEMPLATE = """
 SELECT 
@@ -60,10 +98,13 @@ HTML_TEMPLATE = """
         button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
         .results { margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 4px; }
         .progress { margin: 10px 0; }
+        .status { font-family: monospace; white-space: pre-wrap; }
     </style>
 </head>
 <body>
     <h1>Sales/BD Employee Counter</h1>
+    <p>Process companies in batches to count Sales and Business Development employees.</p>
+    
     <form id="processForm">
         <div class="form-group">
             <label>Company Slugs (one per line):</label>
@@ -75,13 +116,14 @@ salesforce
         <div class="form-group">
             <label>Batch Size:</label>
             <input type="number" id="batchSize" value="1000" min="100" max="5000">
+            <small>Larger batches = faster processing, but may timeout</small>
         </div>
         <button type="submit">Process Companies</button>
     </form>
     
     <div id="results" class="results" style="display:none;">
         <h3>Processing Status</h3>
-        <div id="status"></div>
+        <div id="status" class="status"></div>
         <div id="progress"></div>
         <div id="downloadLink"></div>
     </div>
@@ -99,7 +141,7 @@ salesforce
             }
             
             document.getElementById('results').style.display = 'block';
-            document.getElementById('status').innerHTML = `Processing ${companies.length} companies in batches of ${batchSize}...`;
+            document.getElementById('status').innerHTML = `Processing ${companies.length} companies in batches of ${batchSize}...\\n`;
             
             try {
                 const response = await fetch('/process', {
@@ -111,13 +153,13 @@ salesforce
                 const result = await response.json();
                 
                 if (result.success) {
-                    document.getElementById('status').innerHTML = `Complete! Found ${result.total_results} companies with Sales/BD employees.`;
+                    document.getElementById('status').innerHTML += `\\nComplete! Found ${result.total_results} companies with Sales/BD employees.`;
                     document.getElementById('downloadLink').innerHTML = `<a href="/download/${result.filename}" download>Download Results CSV</a>`;
                 } else {
-                    document.getElementById('status').innerHTML = `Error: ${result.error}`;
+                    document.getElementById('status').innerHTML += `\\nError: ${result.error}`;
                 }
             } catch (error) {
-                document.getElementById('status').innerHTML = `Error: ${error.message}`;
+                document.getElementById('status').innerHTML += `\\nError: ${error.message}`;
             }
         });
     </script>
@@ -129,6 +171,20 @@ salesforce
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/test-connection')
+def test_connection():
+    """Test database connection"""
+    try:
+        db_config = get_db_config()
+        conn = psycopg2.connect(**db_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        result = cursor.fetchone()
+        conn.close()
+        return jsonify({'success': True, 'message': 'Database connection successful'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
 @app.route('/process', methods=['POST'])
 def process_companies():
     try:
@@ -136,6 +192,7 @@ def process_companies():
         companies = data['companies']
         batch_size = data.get('batch_size', 1000)
         
+        db_config = get_db_config()
         all_results = []
         
         # Process in batches
@@ -152,7 +209,7 @@ def process_companies():
             
             # Execute query
             try:
-                conn = psycopg2.connect(**DB_CONFIG)
+                conn = psycopg2.connect(**db_config)
                 df = pd.read_sql(query, conn)
                 all_results.append(df)
                 conn.close()
