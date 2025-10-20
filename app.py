@@ -1,6 +1,5 @@
 import os
 import psycopg2
-import pandas as pd
 import time
 from flask import Flask, request, jsonify, render_template_string
 from typing import List
@@ -273,33 +272,50 @@ def process_companies():
             # Execute query
             try:
                 conn = psycopg2.connect(**db_config)
-                df = pd.read_sql(query, conn)
+                cursor = conn.cursor()
+                cursor.execute(query)
                 
-                # Add HubSpot company IDs if provided
-                if input_format == 'csv':
-                    df['hubspot_company_id'] = df['slug'].map(slug_to_hubspot_id)
-                    # Reorder columns to put hubspot_company_id first
-                    df = df[['hubspot_company_id', 'slug', 'sales_bd_count']]
+                # Fetch results manually (no pandas)
+                results = cursor.fetchall()
+                column_names = [desc[0] for desc in cursor.description]
                 
-                all_results.append(df)
+                # Convert to list of dicts
+                batch_results = []
+                for row in results:
+                    row_dict = dict(zip(column_names, row))
+                    
+                    # Add HubSpot company ID if provided
+                    if input_format == 'csv':
+                        row_dict['hubspot_company_id'] = slug_to_hubspot_id.get(row_dict['slug'], '')
+                    
+                    batch_results.append(row_dict)
+                
+                all_results.extend(batch_results)
                 conn.close()
                 
-                print(f"Batch {batch_num} complete: {len(df)} companies with results")
+                print(f"Batch {batch_num} complete: {len(batch_results)} companies with results")
                 time.sleep(0.5)  # Be nice to the database
                 
             except Exception as e:
                 print(f"Error in batch {batch_num}: {e}")
                 continue
         
-        # Combine all results
+        # Combine all results and save to CSV
         if all_results:
-            final_df = pd.concat(all_results, ignore_index=True)
             filename = f'sales_bd_results_{int(time.time())}.csv'
-            final_df.to_csv(f'/tmp/{filename}', index=False)
+            filepath = f'/tmp/{filename}'
+            
+            # Write CSV manually
+            with open(filepath, 'w', newline='') as csvfile:
+                if all_results:
+                    fieldnames = all_results[0].keys()
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(all_results)
             
             return jsonify({
                 'success': True,
-                'total_results': len(final_df),
+                'total_results': len(all_results),
                 'filename': filename
             })
         else:
