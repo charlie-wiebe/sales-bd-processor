@@ -12,6 +12,7 @@ from datetime import datetime
 import threading
 import json
 import uuid
+import traceback
 
 app = Flask(__name__)
 
@@ -96,11 +97,30 @@ HAVING COUNT(DISTINCT lp.id) > 0;
 """
 
 def process_companies_background(job_id, companies, batch_size, input_format):
-    """Background processing function"""
+    """Background processing function with better error handling"""
+    conn = None
     try:
         with job_lock:
             jobs[job_id]['status'] = 'processing'
             jobs[job_id]['started_at'] = datetime.now().isoformat()
+        
+        print(f"[JOB {job_id}] START: Processing {len(companies)} companies in background", flush=True)
+        sys.stdout.flush()
+        
+        # Test database connection first
+        print(f"[JOB {job_id}] Testing database connection...", flush=True)
+        sys.stdout.flush()
+        
+        db_config = get_db_config()
+        conn = psycopg2.connect(**db_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        result = cursor.fetchone()
+        conn.close()
+        conn = None
+        
+        print(f"[JOB {job_id}] Database connection successful", flush=True)
+        sys.stdout.flush()
         
         # Create timestamped filename
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -115,7 +135,6 @@ def process_companies_background(job_id, companies, batch_size, input_format):
         final_filepath = os.path.join(data_dir, final_filename)
         partial_filepath = os.path.join(data_dir, partial_filename)
         
-        db_config = get_db_config()
         all_results = []
         
         # Create lookup dict for HubSpot IDs if provided
@@ -130,7 +149,7 @@ def process_companies_background(job_id, companies, batch_size, input_format):
             jobs[job_id]['total_batches'] = total_batches
             jobs[job_id]['completed_batches'] = 0
         
-        print(f"[JOB {job_id}] START: Processing {len(companies)} companies in {total_batches} batches", flush=True)
+        print(f"[JOB {job_id}] Processing {len(companies)} companies in {total_batches} batches of {batch_size}", flush=True)
         sys.stdout.flush()
         
         # Process in batches
@@ -145,18 +164,31 @@ def process_companies_background(job_id, companies, batch_size, input_format):
             slug_list = "'" + "', '".join([company['slug'] for company in batch]) + "'"
             query = QUERY_TEMPLATE.format(slug_list)
             
-            # Execute query
+            # Execute query with timeout
+            batch_results = []
             try:
+                print(f"[JOB {job_id}] BATCH {batch_num}: Connecting to database...", flush=True)
+                sys.stdout.flush()
+                
                 conn = psycopg2.connect(**db_config)
                 cursor = conn.cursor()
+                
+                print(f"[JOB {job_id}] BATCH {batch_num}: Executing query...", flush=True)
+                sys.stdout.flush()
+                
                 cursor.execute(query)
+                
+                print(f"[JOB {job_id}] BATCH {batch_num}: Fetching results...", flush=True)
+                sys.stdout.flush()
                 
                 # Fetch results manually (no pandas)
                 results = cursor.fetchall()
                 column_names = [desc[0] for desc in cursor.description]
                 
+                print(f"[JOB {job_id}] BATCH {batch_num}: Got {len(results)} raw results", flush=True)
+                sys.stdout.flush()
+                
                 # Convert to list of dicts
-                batch_results = []
                 for row in results:
                     row_dict = dict(zip(column_names, row))
                     
@@ -168,9 +200,16 @@ def process_companies_background(job_id, companies, batch_size, input_format):
                 
                 all_results.extend(batch_results)
                 conn.close()
+                conn = None
+                
+                print(f"[JOB {job_id}] BATCH {batch_num}: Processed {len(batch_results)} results", flush=True)
+                sys.stdout.flush()
                 
                 # Save partial results after each batch
                 if all_results:
+                    print(f"[JOB {job_id}] BATCH {batch_num}: Saving partial results...", flush=True)
+                    sys.stdout.flush()
+                    
                     with open(partial_filepath, 'w', newline='') as csvfile:
                         fieldnames = all_results[0].keys()
                         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -183,19 +222,35 @@ def process_companies_background(job_id, companies, batch_size, input_format):
                     jobs[job_id]['total_results'] = len(all_results)
                     jobs[job_id]['partial_file'] = partial_filename
                 
-                print(f"[JOB {job_id}] BATCH {batch_num}/{total_batches}: Complete - {len(batch_results)} results (Total: {len(all_results)})", flush=True)
+                print(f"[JOB {job_id}] BATCH {batch_num}/{total_batches}: COMPLETE - {len(batch_results)} new results (Total: {len(all_results)})", flush=True)
                 sys.stdout.flush()
                 
                 # Brief pause to be nice to the database
-                time.sleep(0.5)
+                time.sleep(1.0)
                 
-            except Exception as e:
-                print(f"[JOB {job_id}] BATCH {batch_num}/{total_batches}: ERROR - {e}", flush=True)
+            except Exception as batch_error:
+                if conn:
+                    conn.close()
+                    conn = None
+                
+                error_msg = f"Batch {batch_num} error: {str(batch_error)}"
+                print(f"[JOB {job_id}] BATCH {batch_num}: ERROR - {error_msg}", flush=True)
+                print(f"[JOB {job_id}] BATCH {batch_num}: Traceback - {traceback.format_exc()}", flush=True)
                 sys.stdout.flush()
+                
+                with job_lock:
+                    if 'batch_errors' not in jobs[job_id]:
+                        jobs[job_id]['batch_errors'] = []
+                    jobs[job_id]['batch_errors'].append(error_msg)
+                
+                # Continue with next batch instead of failing entire job
                 continue
         
         # Save final results
         if all_results:
+            print(f"[JOB {job_id}] Saving final results to {final_filename}...", flush=True)
+            sys.stdout.flush()
+            
             # Write final CSV
             with open(final_filepath, 'w', newline='') as csvfile:
                 fieldnames = all_results[0].keys()
@@ -228,12 +283,20 @@ def process_companies_background(job_id, companies, batch_size, input_format):
             sys.stdout.flush()
             
     except Exception as e:
+        if conn:
+            conn.close()
+        
+        error_msg = str(e)
+        traceback_msg = traceback.format_exc()
+        
         with job_lock:
             jobs[job_id]['status'] = 'failed'
-            jobs[job_id]['error'] = str(e)
+            jobs[job_id]['error'] = error_msg
+            jobs[job_id]['traceback'] = traceback_msg
             jobs[job_id]['failed_at'] = datetime.now().isoformat()
         
-        print(f"[JOB {job_id}] FAILED: {e}", flush=True)
+        print(f"[JOB {job_id}] FAILED: {error_msg}", flush=True)
+        print(f"[JOB {job_id}] TRACEBACK: {traceback_msg}", flush=True)
         sys.stdout.flush()
 
 HTML_TEMPLATE = """
@@ -252,6 +315,7 @@ HTML_TEMPLATE = """
         .job-info { margin: 10px 0; padding: 10px; background: white; border-radius: 3px; }
         .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; margin: 10px 0; }
         .progress-fill { height: 100%; background: #007bff; border-radius: 10px; transition: width 0.3s; }
+        .error { color: red; font-size: 12px; }
     </style>
 </head>
 <body>
@@ -292,8 +356,8 @@ HTML_TEMPLATE = """
             
             <div class="form-group">
                 <label>Batch Size:</label>
-                <input type="number" id="batchSize" value="500" min="100" max="2000">
-                <small>Smaller batches = more reliable processing</small>
+                <input type="number" id="batchSize" value="100" min="10" max="500">
+                <small>Start with 100 for reliability. Increase if working well.</small>
             </div>
             <button type="submit">Start Background Job</button>
         </form>
@@ -303,6 +367,7 @@ HTML_TEMPLATE = """
         <h3>Job Status</h3>
         <button onclick="checkStatus()">Refresh Status</button>
         <button onclick="downloadLatest()">Download Latest CSV</button>
+        <button onclick="testConnection()">Test DB Connection</button>
         <div id="jobStatus">Click "Refresh Status" to check current jobs</div>
     </div>
 
@@ -323,6 +388,21 @@ HTML_TEMPLATE = """
                 }
             });
         });
+
+        function testConnection() {
+            fetch('/test-connection')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('Database connection successful!');
+                    } else {
+                        alert('Database connection failed: ' + data.error);
+                    }
+                })
+                .catch(error => {
+                    alert('Error testing connection: ' + error.message);
+                });
+        }
 
         function checkStatus() {
             fetch('/status')
@@ -353,7 +433,11 @@ HTML_TEMPLATE = """
                             }
                             
                             if (job.error) {
-                                statusHtml += `<br><span style="color: red;">Error: ${job.error}</span>`;
+                                statusHtml += `<br><span class="error">Error: ${job.error}</span>`;
+                            }
+                            
+                            if (job.batch_errors && job.batch_errors.length > 0) {
+                                statusHtml += `<br><span class="error">Batch errors: ${job.batch_errors.length}</span>`;
                             }
                             
                             statusHtml += '</div>';
@@ -422,12 +506,12 @@ HTML_TEMPLATE = """
             }
         });
 
-        // Auto-refresh status every 10 seconds if there's an active job
+        // Auto-refresh status every 15 seconds if there's an active job
         setInterval(() => {
             if (currentJobId) {
                 checkStatus();
             }
-        }, 10000);
+        }, 15000);
 
         // Load status on page load
         window.onload = function() {
@@ -446,15 +530,26 @@ def index():
 def test_connection():
     """Test database connection"""
     try:
+        print("[TEST] Testing database connection...", flush=True)
+        sys.stdout.flush()
+        
         db_config = get_db_config()
         conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         cursor.execute("SELECT 1")
         result = cursor.fetchone()
         conn.close()
+        
+        print("[TEST] Database connection successful", flush=True)
+        sys.stdout.flush()
+        
         return jsonify({'success': True, 'message': 'Database connection successful'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        error_msg = str(e)
+        print(f"[TEST] Database connection failed: {error_msg}", flush=True)
+        sys.stdout.flush()
+        
+        return jsonify({'success': False, 'error': error_msg})
 
 @app.route('/start-job', methods=['POST'])
 def start_job():
@@ -462,11 +557,14 @@ def start_job():
     try:
         data = request.json
         companies = data['companies']
-        batch_size = data.get('batch_size', 500)
+        batch_size = data.get('batch_size', 100)  # Reduced default
         input_format = data.get('input_format', 'slugs')
         
         # Generate unique job ID
         job_id = str(uuid.uuid4())
+        
+        print(f"[API] Starting job {job_id} for {len(companies)} companies", flush=True)
+        sys.stdout.flush()
         
         # Store job info
         with job_lock:
@@ -494,6 +592,8 @@ def start_job():
         })
         
     except Exception as e:
+        print(f"[API] Error starting job: {e}", flush=True)
+        sys.stdout.flush()
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/status')
@@ -507,11 +607,11 @@ def get_status():
         job_list.sort(key=lambda x: x['created_at'], reverse=True)
         
         return jsonify({
-            'success': True,
+            'api_success': True,
             'jobs': job_list
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e), 'jobs': []})
+        return jsonify({'api_success': False, 'error': str(e), 'jobs': []})
 
 @app.route('/download-csv/<filename>')
 def download_csv(filename):
