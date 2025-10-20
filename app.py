@@ -8,6 +8,7 @@ import tempfile
 import base64
 import csv
 import sys
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -104,11 +105,19 @@ HTML_TEMPLATE = """
         .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; margin: 10px 0; }
         .progress-fill { height: 100%; background: #007bff; border-radius: 10px; transition: width 0.3s; }
         .download-section { margin: 20px 0; padding: 15px; background: #d4edda; border-radius: 4px; }
+        .file-list { margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 4px; }
+        .file-item { margin: 5px 0; padding: 8px; background: white; border-radius: 3px; }
     </style>
 </head>
 <body>
     <h1>Sales/BD Employee Counter</h1>
     <p>Process companies in batches to count Sales and Business Development employees.</p>
+    
+    <div class="file-list">
+        <h3>Saved Files</h3>
+        <div id="savedFiles">Loading...</div>
+        <button onclick="loadSavedFiles()">Refresh File List</button>
+    </div>
     
     <form id="processForm">
         <div class="form-group">
@@ -156,7 +165,7 @@ HTML_TEMPLATE = """
         <div id="progressText">0% complete (0 / 0 batches)</div>
         <div id="status" class="status"></div>
         <div id="downloadSection" class="download-section" style="display:none;">
-            <strong>Partial Results Available:</strong>
+            <strong>Results Available:</strong>
             <div id="downloadLink"></div>
         </div>
     </div>
@@ -166,6 +175,32 @@ HTML_TEMPLATE = """
         let totalBatches = 0;
         let completedBatches = 0;
         let isProcessing = false;
+
+        // Load saved files on page load
+        window.onload = function() {
+            loadSavedFiles();
+        };
+
+        function loadSavedFiles() {
+            fetch('/saved-files')
+                .then(response => response.json())
+                .then(data => {
+                    const container = document.getElementById('savedFiles');
+                    if (data.files && data.files.length > 0) {
+                        container.innerHTML = data.files.map(file => 
+                            `<div class="file-item">
+                                <strong>${file.name}</strong> (${file.size}, ${file.created})
+                                <a href="/download-saved/${file.name}" download style="margin-left: 10px;">Download</a>
+                            </div>`
+                        ).join('');
+                    } else {
+                        container.innerHTML = '<em>No saved files found</em>';
+                    }
+                })
+                .catch(error => {
+                    document.getElementById('savedFiles').innerHTML = '<em>Error loading files</em>';
+                });
+        }
 
         // Toggle examples based on input format
         document.querySelectorAll('input[name="inputFormat"]').forEach(radio => {
@@ -278,15 +313,16 @@ HTML_TEMPLATE = """
                 
                 if (result.success) {
                     updateProgress(totalBatches, totalBatches, `\\nComplete! Found ${result.total_results} companies with Sales/BD employees.`);
-                    document.getElementById('downloadLink').innerHTML = `<a href="/download/${result.filename}" download>Download Final Results CSV</a>`;
+                    document.getElementById('downloadLink').innerHTML = `<a href="/download-saved/${result.filename}" download>Download Final Results CSV</a>`;
                     document.getElementById('downloadSection').style.display = 'block';
+                    loadSavedFiles(); // Refresh file list
                 } else {
                     updateProgress(completedBatches, totalBatches, `\\nError: ${result.error}`);
-                    savePartialResults();
+                    loadSavedFiles(); // Check for partial files
                 }
             } catch (error) {
                 updateProgress(completedBatches, totalBatches, `\\nError: ${error.message}`);
-                savePartialResults();
+                loadSavedFiles(); // Check for partial files
             } finally {
                 isProcessing = false;
             }
@@ -323,6 +359,50 @@ def test_connection():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
+@app.route('/saved-files')
+def list_saved_files():
+    """List all saved CSV files"""
+    try:
+        data_dir = '/data'
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
+        
+        files = []
+        for filename in os.listdir(data_dir):
+            if filename.endswith('.csv'):
+                filepath = os.path.join(data_dir, filename)
+                stat = os.stat(filepath)
+                files.append({
+                    'name': filename,
+                    'size': f"{stat.st_size / 1024:.1f} KB",
+                    'created': datetime.fromtimestamp(stat.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
+                })
+        
+        # Sort by creation time, newest first
+        files.sort(key=lambda x: x['created'], reverse=True)
+        
+        return jsonify({'success': True, 'files': files})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'files': []})
+
+@app.route('/download-saved/<filename>')
+def download_saved_file(filename):
+    """Download a saved CSV file"""
+    try:
+        filepath = os.path.join('/data', filename)
+        if not os.path.exists(filepath) or not filename.endswith('.csv'):
+            return 'File not found', 404
+            
+        with open(filepath, 'r') as f:
+            content = f.read()
+        
+        return content, 200, {
+            'Content-Type': 'text/csv',
+            'Content-Disposition': f'attachment; filename={filename}'
+        }
+    except Exception as e:
+        return f'Error reading file: {e}', 500
+
 @app.route('/process', methods=['POST'])
 def process_companies():
     try:
@@ -330,6 +410,19 @@ def process_companies():
         companies = data['companies']  # List of {slug: "...", hubspot_company_id: "..."} or {slug: "..."}
         batch_size = data.get('batch_size', 1000)
         input_format = data.get('input_format', 'slugs')
+        
+        # Create timestamped filename
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        final_filename = f'sales_bd_results_{timestamp}.csv'
+        partial_filename = f'sales_bd_partial_{timestamp}.csv'
+        
+        # Ensure data directory exists
+        data_dir = '/data'
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
+        
+        final_filepath = os.path.join(data_dir, final_filename)
+        partial_filepath = os.path.join(data_dir, partial_filename)
         
         db_config = get_db_config()
         all_results = []
@@ -341,6 +434,9 @@ def process_companies():
                 slug_to_hubspot_id[company['slug']] = company['hubspot_company_id']
         
         total_batches = (len(companies) + batch_size - 1) // batch_size
+        
+        print(f"[START] Processing {len(companies)} companies in {total_batches} batches. Saving to {final_filename}", flush=True)
+        sys.stdout.flush()
         
         # Process in batches
         for i in range(0, len(companies), batch_size):
@@ -379,6 +475,14 @@ def process_companies():
                 all_results.extend(batch_results)
                 conn.close()
                 
+                # Save partial results after each batch
+                if all_results:
+                    with open(partial_filepath, 'w', newline='') as csvfile:
+                        fieldnames = all_results[0].keys()
+                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(all_results)
+                
                 print(f"[BATCH {batch_num}/{total_batches}] Complete: {len(batch_results)} companies with results (Total so far: {len(all_results)})", flush=True)
                 sys.stdout.flush()
                 
@@ -390,25 +494,26 @@ def process_companies():
                 sys.stdout.flush()
                 continue
         
-        # Save results to CSV
+        # Save final results
         if all_results:
-            filename = f'sales_bd_results_{int(time.time())}.csv'
-            filepath = f'/tmp/{filename}'
-            
-            # Write CSV manually
-            with open(filepath, 'w', newline='') as csvfile:
+            # Write final CSV
+            with open(final_filepath, 'w', newline='') as csvfile:
                 fieldnames = all_results[0].keys()
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(all_results)
             
-            print(f"[COMPLETE] Processed {total_batches} batches. Final results: {len(all_results)} companies with Sales/BD employees", flush=True)
+            # Remove partial file since we have final results
+            if os.path.exists(partial_filepath):
+                os.remove(partial_filepath)
+            
+            print(f"[COMPLETE] Processed {total_batches} batches. Final results: {len(all_results)} companies with Sales/BD employees. Saved to {final_filename}", flush=True)
             sys.stdout.flush()
             
             return jsonify({
                 'success': True,
                 'total_results': len(all_results),
-                'filename': filename,
+                'filename': final_filename,
                 'batches_processed': total_batches
             })
         else:
@@ -421,18 +526,10 @@ def process_companies():
         sys.stdout.flush()
         return jsonify({'success': False, 'error': str(e)})
 
+# Legacy download endpoint for backward compatibility
 @app.route('/download/<filename>')
 def download_file(filename):
-    try:
-        with open(f'/tmp/{filename}', 'r') as f:
-            content = f.read()
-        
-        return content, 200, {
-            'Content-Type': 'text/csv',
-            'Content-Disposition': f'attachment; filename={filename}'
-        }
-    except Exception as e:
-        return f'File not found: {e}', 404
+    return download_saved_file(filename)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
