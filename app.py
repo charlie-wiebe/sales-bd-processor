@@ -66,9 +66,9 @@ def get_db_config():
     return config
 
 QUERY_TEMPLATE = """
-SELECT 
+SELECT DISTINCT ON (LOWER(lp.first_name), LOWER(lp.last_name), lcs.slug)
     lcs.slug,
-    COUNT(DISTINCT lp.id) AS sales_bd_count
+    COUNT(DISTINCT lp.id) OVER (PARTITION BY lcs.slug) AS sales_bd_count
 FROM linkedin_profile_position3 lpp3
 INNER JOIN linkedin_company lc ON lpp3.linkedin_company_id = lc.id
 INNER JOIN linkedin_company_slug lcs ON lc.id = lcs.linkedin_company_id
@@ -78,6 +78,7 @@ LEFT JOIN job_title jt ON cp3.job_title_id = jt.id
 WHERE lcs.slug IN ({})
   AND lpp3.is_current = true
   AND lpp3.obsolete = false
+  AND (lpp3.end_date IS NULL OR lpp3.end_date > CURRENT_DATE)
   AND jt.tags && ARRAY[31, 45]
   AND NOT (
     LOWER(lpp3.title) LIKE '%investor%' OR LOWER(lpp3.title) LIKE '%advisor%'
@@ -92,8 +93,7 @@ WHERE lcs.slug IN ({})
     OR LOWER(lpp3.title) LIKE '%solutions%' OR LOWER(lpp3.title) LIKE '%owner%'
     OR LOWER(lpp3.title) LIKE '%ceo%' OR LOWER(lpp3.title) LIKE '%partner%'
   )
-GROUP BY lcs.slug
-HAVING COUNT(DISTINCT lp.id) > 0;
+ORDER BY LOWER(lp.first_name), LOWER(lp.last_name), lcs.slug, lp.updated_at DESC NULLS LAST;
 """
 
 def process_companies_background(job_id, companies, batch_size, input_format):
@@ -188,15 +188,23 @@ def process_companies_background(job_id, companies, batch_size, input_format):
                 print(f"[JOB {job_id}] BATCH {batch_num}: Got {len(results)} raw results", flush=True)
                 sys.stdout.flush()
                 
-                # Convert to list of dicts
+                # Convert to list of dicts - aggregate by slug to get unique counts
+                slug_counts = {}
                 for row in results:
                     row_dict = dict(zip(column_names, row))
+                    slug = row_dict['slug']
+                    count = row_dict['sales_bd_count']
                     
-                    # Add HubSpot company ID if provided
-                    if input_format == 'csv':
-                        row_dict['hubspot_company_id'] = slug_to_hubspot_id.get(row_dict['slug'], '')
-                    
-                    batch_results.append(row_dict)
+                    # Only keep one row per slug (they all have the same count)
+                    if slug not in slug_counts:
+                        result_row = {'slug': slug, 'sales_bd_count': count}
+                        
+                        # Add HubSpot company ID if provided
+                        if input_format == 'csv':
+                            result_row['hubspot_company_id'] = slug_to_hubspot_id.get(slug, '')
+                        
+                        slug_counts[slug] = result_row
+                        batch_results.append(result_row)
                 
                 all_results.extend(batch_results)
                 conn.close()
