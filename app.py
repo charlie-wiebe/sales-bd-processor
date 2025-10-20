@@ -324,6 +324,8 @@ HTML_TEMPLATE = """
         .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; margin: 10px 0; }
         .progress-fill { height: 100%; background: #007bff; border-radius: 10px; transition: width 0.3s; }
         .error { color: red; font-size: 12px; }
+        .file-list { background: white; padding: 10px; border-radius: 3px; margin: 10px 0; }
+        .file-item { margin: 5px 0; padding: 5px; background: #f8f9fa; border-radius: 3px; }
     </style>
 </head>
 <body>
@@ -372,11 +374,13 @@ HTML_TEMPLATE = """
     </div>
     
     <div class="section">
-        <h3>Job Status</h3>
+        <h3>Job Status & Files</h3>
         <button onclick="checkStatus()">Refresh Status</button>
+        <button onclick="listFiles()">List All CSV Files</button>
         <button onclick="downloadLatest()">Download Latest CSV</button>
         <button onclick="testConnection()">Test DB Connection</button>
         <div id="jobStatus">Click "Refresh Status" to check current jobs</div>
+        <div id="fileList"></div>
     </div>
 
     <script>
@@ -409,6 +413,28 @@ HTML_TEMPLATE = """
                 })
                 .catch(error => {
                     alert('Error testing connection: ' + error.message);
+                });
+        }
+
+        function listFiles() {
+            fetch('/list-files')
+                .then(response => response.json())
+                .then(data => {
+                    const container = document.getElementById('fileList');
+                    if (data.success && data.files && data.files.length > 0) {
+                        container.innerHTML = '<div class="file-list"><h4>Saved CSV Files:</h4>' + 
+                            data.files.map(file => 
+                                `<div class="file-item">
+                                    <strong>${file.name}</strong> - ${file.size} bytes - ${new Date(file.modified).toLocaleString()}
+                                    <br><a href="/download-csv/${file.name}" download>Download</a>
+                                </div>`
+                            ).join('') + '</div>';
+                    } else {
+                        container.innerHTML = '<div class="file-list"><em>No CSV files found</em></div>';
+                    }
+                })
+                .catch(error => {
+                    document.getElementById('fileList').innerHTML = '<div class="file-list"><em>Error loading files</em></div>';
                 });
         }
 
@@ -521,9 +547,10 @@ HTML_TEMPLATE = """
             }
         }, 15000);
 
-        // Load status on page load
+        // Load status and files on page load
         window.onload = function() {
             checkStatus();
+            listFiles();
         };
     </script>
 </body>
@@ -533,6 +560,33 @@ HTML_TEMPLATE = """
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+@app.route('/list-files')
+def list_files():
+    """List all CSV files in the data directory"""
+    try:
+        data_dir = '/data'
+        if not os.path.exists(data_dir):
+            return jsonify({'success': False, 'error': 'Data directory not found', 'files': []})
+        
+        csv_files = []
+        for filename in os.listdir(data_dir):
+            if filename.endswith('.csv'):
+                filepath = os.path.join(data_dir, filename)
+                stat = os.stat(filepath)
+                csv_files.append({
+                    'name': filename,
+                    'size': stat.st_size,
+                    'modified': datetime.fromtimestamp(stat.st_mtime).isoformat()
+                })
+        
+        # Sort by modification time, newest first
+        csv_files.sort(key=lambda x: x['modified'], reverse=True)
+        
+        return jsonify({'success': True, 'files': csv_files})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'files': []})
 
 @app.route('/test-connection')
 def test_connection():
