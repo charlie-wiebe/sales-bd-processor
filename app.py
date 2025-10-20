@@ -66,34 +66,42 @@ def get_db_config():
     return config
 
 QUERY_TEMPLATE = """
-SELECT DISTINCT ON (LOWER(lp.first_name), LOWER(lp.last_name), lcs.slug)
-    lcs.slug,
-    COUNT(DISTINCT lp.id) OVER (PARTITION BY lcs.slug) AS sales_bd_count
-FROM linkedin_profile_position3 lpp3
-INNER JOIN linkedin_company lc ON lpp3.linkedin_company_id = lc.id
-INNER JOIN linkedin_company_slug lcs ON lc.id = lcs.linkedin_company_id
-INNER JOIN linkedin_profile lp ON lpp3.linkedin_profile_id = lp.id
-LEFT JOIN company_position3 cp3 ON cp3.linkedin_profile_position3_id = lpp3.id
-LEFT JOIN job_title jt ON cp3.job_title_id = jt.id
-WHERE lcs.slug IN ({})
-  AND lpp3.is_current = true
-  AND lpp3.obsolete = false
-  AND (lpp3.end_date IS NULL OR lpp3.end_date > CURRENT_DATE)
-  AND jt.tags && ARRAY[31, 45]
-  AND NOT (
-    LOWER(lpp3.title) LIKE '%investor%' OR LOWER(lpp3.title) LIKE '%advisor%'
-    OR LOWER(lpp3.title) LIKE '%board%' OR LOWER(lpp3.title) LIKE '%founder%'
-    OR LOWER(lpp3.title) LIKE '%vp%' OR LOWER(lpp3.title) LIKE '%vice%'
-    OR LOWER(lpp3.title) LIKE '%cro%' OR LOWER(lpp3.title) LIKE '%chief%'
-    OR LOWER(lpp3.title) LIKE '%director%' OR LOWER(lpp3.title) LIKE '%ops%'
-    OR LOWER(lpp3.title) LIKE '%operations%' OR LOWER(lpp3.title) LIKE '%enablement%'
-    OR LOWER(lpp3.title) LIKE '%coordinator%' OR LOWER(lpp3.title) LIKE '%assistant%'
-    OR LOWER(lpp3.title) LIKE '%customer success%' OR LOWER(lpp3.title) LIKE '%client success%'
-    OR LOWER(lpp3.title) LIKE '%support%' OR LOWER(lpp3.title) LIKE '%manager%'
-    OR LOWER(lpp3.title) LIKE '%solutions%' OR LOWER(lpp3.title) LIKE '%owner%'
-    OR LOWER(lpp3.title) LIKE '%ceo%' OR LOWER(lpp3.title) LIKE '%partner%'
-  )
-ORDER BY LOWER(lp.first_name), LOWER(lp.last_name), lcs.slug, lp.updated_at DESC NULLS LAST;
+SELECT 
+    slug,
+    COUNT(*) AS sales_bd_count
+FROM (
+    SELECT DISTINCT ON (LOWER(lp.first_name), LOWER(lp.last_name), lcs.slug)
+        lcs.slug,
+        lp.id AS profile_id
+    FROM linkedin_profile_position3 lpp3
+    INNER JOIN linkedin_company lc ON lpp3.linkedin_company_id = lc.id
+    INNER JOIN linkedin_company_slug lcs ON lc.id = lcs.linkedin_company_id
+    INNER JOIN linkedin_profile lp ON lpp3.linkedin_profile_id = lp.id
+    LEFT JOIN company_position3 cp3 ON cp3.linkedin_profile_position3_id = lpp3.id
+    LEFT JOIN job_title jt ON cp3.job_title_id = jt.id
+    WHERE lcs.slug IN ({})
+      AND lcs.slug_status = 'A'
+      AND lp.slug_status = 'A'
+      AND lpp3.is_current = true
+      AND lpp3.obsolete = false
+      AND (lpp3.end_date IS NULL OR lpp3.end_date > CURRENT_DATE)
+      AND jt.tags && ARRAY[31, 45]
+      AND NOT (
+        LOWER(lpp3.title) LIKE '%investor%' OR LOWER(lpp3.title) LIKE '%advisor%'
+        OR LOWER(lpp3.title) LIKE '%board%' OR LOWER(lpp3.title) LIKE '%founder%'
+        OR LOWER(lpp3.title) LIKE '%vp%' OR LOWER(lpp3.title) LIKE '%vice%'
+        OR LOWER(lpp3.title) LIKE '%cro%' OR LOWER(lpp3.title) LIKE '%chief%'
+        OR LOWER(lpp3.title) LIKE '%director%' OR LOWER(lpp3.title) LIKE '%ops%'
+        OR LOWER(lpp3.title) LIKE '%operations%' OR LOWER(lpp3.title) LIKE '%enablement%'
+        OR LOWER(lpp3.title) LIKE '%coordinator%' OR LOWER(lpp3.title) LIKE '%assistant%'
+        OR LOWER(lpp3.title) LIKE '%customer success%' OR LOWER(lpp3.title) LIKE '%client success%'
+        OR LOWER(lpp3.title) LIKE '%support%' OR LOWER(lpp3.title) LIKE '%manager%'
+        OR LOWER(lpp3.title) LIKE '%solutions%' OR LOWER(lpp3.title) LIKE '%owner%'
+        OR LOWER(lpp3.title) LIKE '%ceo%' OR LOWER(lpp3.title) LIKE '%partner%'
+      )
+    ORDER BY LOWER(lp.first_name), LOWER(lp.last_name), lcs.slug, lp.updated_at DESC NULLS LAST
+) AS deduplicated_people
+GROUP BY slug;
 """
 
 def process_companies_background(job_id, companies, batch_size, input_format):
@@ -188,23 +196,15 @@ def process_companies_background(job_id, companies, batch_size, input_format):
                 print(f"[JOB {job_id}] BATCH {batch_num}: Got {len(results)} raw results", flush=True)
                 sys.stdout.flush()
                 
-                # Convert to list of dicts - aggregate by slug to get unique counts
-                slug_counts = {}
+                # Convert to list of dicts
                 for row in results:
                     row_dict = dict(zip(column_names, row))
-                    slug = row_dict['slug']
-                    count = row_dict['sales_bd_count']
                     
-                    # Only keep one row per slug (they all have the same count)
-                    if slug not in slug_counts:
-                        result_row = {'slug': slug, 'sales_bd_count': count}
-                        
-                        # Add HubSpot company ID if provided
-                        if input_format == 'csv':
-                            result_row['hubspot_company_id'] = slug_to_hubspot_id.get(slug, '')
-                        
-                        slug_counts[slug] = result_row
-                        batch_results.append(result_row)
+                    # Add HubSpot company ID if provided
+                    if input_format == 'csv':
+                        row_dict['hubspot_company_id'] = slug_to_hubspot_id.get(row_dict['slug'], '')
+                    
+                    batch_results.append(row_dict)
                 
                 all_results.extend(batch_results)
                 conn.close()
