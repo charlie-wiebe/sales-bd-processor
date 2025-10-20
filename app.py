@@ -9,8 +9,15 @@ import base64
 import csv
 import sys
 from datetime import datetime
+import threading
+import json
+import uuid
 
 app = Flask(__name__)
+
+# Global job storage
+jobs = {}
+job_lock = threading.Lock()
 
 def setup_ssl_files():
     """Setup SSL certificate files from environment variables"""
@@ -88,328 +95,12 @@ GROUP BY lcs.slug
 HAVING COUNT(DISTINCT lp.id) > 0;
 """
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Sales/BD Processor</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-        .form-group { margin: 20px 0; }
-        textarea { width: 100%; height: 200px; }
-        button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
-        .results { margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 4px; }
-        .progress { margin: 10px 0; }
-        .status { font-family: monospace; white-space: pre-wrap; }
-        .example { background: #e9ecef; padding: 10px; border-radius: 4px; margin: 10px 0; font-family: monospace; }
-        .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; margin: 10px 0; }
-        .progress-fill { height: 100%; background: #007bff; border-radius: 10px; transition: width 0.3s; }
-        .download-section { margin: 20px 0; padding: 15px; background: #d4edda; border-radius: 4px; }
-        .file-list { margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 4px; }
-        .file-item { margin: 5px 0; padding: 8px; background: white; border-radius: 3px; }
-    </style>
-</head>
-<body>
-    <h1>Sales/BD Employee Counter</h1>
-    <p>Process companies in batches to count Sales and Business Development employees.</p>
-    
-    <div class="file-list">
-        <h3>Saved Files</h3>
-        <div id="savedFiles">Loading...</div>
-        <button onclick="loadSavedFiles()">Refresh File List</button>
-    </div>
-    
-    <form id="processForm">
-        <div class="form-group">
-            <label>Input Format (choose one):</label>
-            <div>
-                <input type="radio" id="slugsOnly" name="inputFormat" value="slugs" checked>
-                <label for="slugsOnly">Company slugs only (one per line)</label>
-            </div>
-            <div>
-                <input type="radio" id="csvFormat" name="inputFormat" value="csv">
-                <label for="csvFormat">CSV format: hubspot_company_id,slug</label>
-            </div>
-        </div>
-        
-        <div class="form-group">
-            <label>Company Data:</label>
-            <div class="example" id="slugExample">
-                Example (slugs only):
-                nooksapp
-                hubspot
-                salesforce
-            </div>
-            <div class="example" id="csvExample" style="display:none;">
-                Example (CSV format):
-                12345,nooksapp
-                67890,hubspot
-                11111,salesforce
-            </div>
-            <textarea id="companies" placeholder="Enter your company data here..."></textarea>
-        </div>
-        
-        <div class="form-group">
-            <label>Batch Size:</label>
-            <input type="number" id="batchSize" value="1000" min="100" max="5000">
-            <small>Larger batches = faster processing, but may timeout</small>
-        </div>
-        <button type="submit">Process Companies</button>
-    </form>
-    
-    <div id="results" class="results" style="display:none;">
-        <h3>Processing Status</h3>
-        <div class="progress-bar">
-            <div id="progressFill" class="progress-fill" style="width: 0%"></div>
-        </div>
-        <div id="progressText">0% complete (0 / 0 batches)</div>
-        <div id="status" class="status"></div>
-        <div id="downloadSection" class="download-section" style="display:none;">
-            <strong>Results Available:</strong>
-            <div id="downloadLink"></div>
-        </div>
-    </div>
-
-    <script>
-        let currentResults = [];
-        let totalBatches = 0;
-        let completedBatches = 0;
-        let isProcessing = false;
-
-        // Load saved files on page load
-        window.onload = function() {
-            loadSavedFiles();
-        };
-
-        function loadSavedFiles() {
-            fetch('/saved-files')
-                .then(response => response.json())
-                .then(data => {
-                    const container = document.getElementById('savedFiles');
-                    if (data.files && data.files.length > 0) {
-                        container.innerHTML = data.files.map(file => 
-                            `<div class="file-item">
-                                <strong>${file.name}</strong> (${file.size}, ${file.created})
-                                <a href="/download-saved/${file.name}" download style="margin-left: 10px;">Download</a>
-                            </div>`
-                        ).join('');
-                    } else {
-                        container.innerHTML = '<em>No saved files found</em>';
-                    }
-                })
-                .catch(error => {
-                    document.getElementById('savedFiles').innerHTML = '<em>Error loading files</em>';
-                });
-        }
-
-        // Toggle examples based on input format
-        document.querySelectorAll('input[name="inputFormat"]').forEach(radio => {
-            radio.addEventListener('change', function() {
-                if (this.value === 'slugs') {
-                    document.getElementById('slugExample').style.display = 'block';
-                    document.getElementById('csvExample').style.display = 'none';
-                    document.getElementById('companies').placeholder = 'nooksapp\\nhubspot\\nsalesforce\\n...';
-                } else {
-                    document.getElementById('slugExample').style.display = 'none';
-                    document.getElementById('csvExample').style.display = 'block';
-                    document.getElementById('companies').placeholder = '12345,nooksapp\\n67890,hubspot\\n11111,salesforce\\n...';
-                }
-            });
-        });
-
-        function updateProgress(completed, total, message) {
-            const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
-            document.getElementById('progressFill').style.width = percentage + '%';
-            document.getElementById('progressText').textContent = 
-                `${percentage}% complete (${completed} / ${total} batches)`;
-            
-            if (message) {
-                document.getElementById('status').textContent += message + '\\n';
-            }
-        }
-
-        function savePartialResults() {
-            if (currentResults.length > 0) {
-                const filename = `partial_results_${Date.now()}.csv`;
-                const csvContent = convertToCSV(currentResults);
-                const blob = new Blob([csvContent], { type: 'text/csv' });
-                const url = window.URL.createObjectURL(blob);
-                
-                document.getElementById('downloadSection').style.display = 'block';
-                document.getElementById('downloadLink').innerHTML = 
-                    `<a href="${url}" download="${filename}">Download Partial Results (${currentResults.length} companies)</a>`;
-            }
-        }
-
-        function convertToCSV(data) {
-            if (data.length === 0) return '';
-            
-            const headers = Object.keys(data[0]);
-            const csvRows = [headers.join(',')];
-            
-            for (const row of data) {
-                const values = headers.map(header => {
-                    const value = row[header] || '';
-                    return typeof value === 'string' && value.includes(',') ? `"${value}"` : value;
-                });
-                csvRows.push(values.join(','));
-            }
-            
-            return csvRows.join('\\n');
-        }
-        
-        document.getElementById('processForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            if (isProcessing) {
-                alert('Processing already in progress. Please wait or refresh the page to start over.');
-                return;
-            }
-            
-            const inputFormat = document.querySelector('input[name="inputFormat"]:checked').value;
-            const inputData = document.getElementById('companies').value.trim();
-            const batchSize = parseInt(document.getElementById('batchSize').value);
-            
-            if (!inputData) {
-                alert('Please enter company data');
-                return;
-            }
-            
-            // Parse input based on format
-            let companies = [];
-            if (inputFormat === 'slugs') {
-                companies = inputData.split('\\n').filter(line => line.trim()).map(slug => ({slug: slug.trim()}));
-            } else {
-                companies = inputData.split('\\n').filter(line => line.trim()).map(line => {
-                    const [hubspot_id, slug] = line.split(',').map(s => s.trim());
-                    return {hubspot_company_id: hubspot_id, slug: slug};
-                });
-            }
-            
-            if (companies.length === 0) {
-                alert('No valid company data found');
-                return;
-            }
-            
-            // Reset state
-            currentResults = [];
-            totalBatches = Math.ceil(companies.length / batchSize);
-            completedBatches = 0;
-            isProcessing = true;
-            
-            document.getElementById('results').style.display = 'block';
-            document.getElementById('downloadSection').style.display = 'none';
-            document.getElementById('status').textContent = `Starting processing of ${companies.length} companies in ${totalBatches} batches...\\n`;
-            updateProgress(0, totalBatches);
-            
-            try {
-                const response = await fetch('/process', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ companies, batch_size: batchSize, input_format: inputFormat })
-                });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    updateProgress(totalBatches, totalBatches, `\\nComplete! Found ${result.total_results} companies with Sales/BD employees.`);
-                    document.getElementById('downloadLink').innerHTML = `<a href="/download-saved/${result.filename}" download>Download Final Results CSV</a>`;
-                    document.getElementById('downloadSection').style.display = 'block';
-                    loadSavedFiles(); // Refresh file list
-                } else {
-                    updateProgress(completedBatches, totalBatches, `\\nError: ${result.error}`);
-                    loadSavedFiles(); // Check for partial files
-                }
-            } catch (error) {
-                updateProgress(completedBatches, totalBatches, `\\nError: ${error.message}`);
-                loadSavedFiles(); // Check for partial files
-            } finally {
-                isProcessing = false;
-            }
-        });
-
-        // Handle page unload
-        window.addEventListener('beforeunload', function(e) {
-            if (isProcessing) {
-                e.preventDefault();
-                e.returnValue = 'Processing is still in progress. Are you sure you want to leave?';
-                return e.returnValue;
-            }
-        });
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/test-connection')
-def test_connection():
-    """Test database connection"""
+def process_companies_background(job_id, companies, batch_size, input_format):
+    """Background processing function"""
     try:
-        db_config = get_db_config()
-        conn = psycopg2.connect(**db_config)
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        result = cursor.fetchone()
-        conn.close()
-        return jsonify({'success': True, 'message': 'Database connection successful'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/saved-files')
-def list_saved_files():
-    """List all saved CSV files"""
-    try:
-        data_dir = '/data'
-        if not os.path.exists(data_dir):
-            os.makedirs(data_dir)
-        
-        files = []
-        for filename in os.listdir(data_dir):
-            if filename.endswith('.csv'):
-                filepath = os.path.join(data_dir, filename)
-                stat = os.stat(filepath)
-                files.append({
-                    'name': filename,
-                    'size': f"{stat.st_size / 1024:.1f} KB",
-                    'created': datetime.fromtimestamp(stat.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
-                })
-        
-        # Sort by creation time, newest first
-        files.sort(key=lambda x: x['created'], reverse=True)
-        
-        return jsonify({'success': True, 'files': files})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e), 'files': []})
-
-@app.route('/download-saved/<filename>')
-def download_saved_file(filename):
-    """Download a saved CSV file"""
-    try:
-        filepath = os.path.join('/data', filename)
-        if not os.path.exists(filepath) or not filename.endswith('.csv'):
-            return 'File not found', 404
-            
-        with open(filepath, 'r') as f:
-            content = f.read()
-        
-        return content, 200, {
-            'Content-Type': 'text/csv',
-            'Content-Disposition': f'attachment; filename={filename}'
-        }
-    except Exception as e:
-        return f'Error reading file: {e}', 500
-
-@app.route('/process', methods=['POST'])
-def process_companies():
-    try:
-        data = request.json
-        companies = data['companies']  # List of {slug: "...", hubspot_company_id: "..."} or {slug: "..."}
-        batch_size = data.get('batch_size', 1000)
-        input_format = data.get('input_format', 'slugs')
+        with job_lock:
+            jobs[job_id]['status'] = 'processing'
+            jobs[job_id]['started_at'] = datetime.now().isoformat()
         
         # Create timestamped filename
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -435,7 +126,11 @@ def process_companies():
         
         total_batches = (len(companies) + batch_size - 1) // batch_size
         
-        print(f"[START] Processing {len(companies)} companies in {total_batches} batches. Saving to {final_filename}", flush=True)
+        with job_lock:
+            jobs[job_id]['total_batches'] = total_batches
+            jobs[job_id]['completed_batches'] = 0
+        
+        print(f"[JOB {job_id}] START: Processing {len(companies)} companies in {total_batches} batches", flush=True)
         sys.stdout.flush()
         
         # Process in batches
@@ -443,8 +138,7 @@ def process_companies():
             batch = companies[i:i+batch_size]
             batch_num = (i // batch_size) + 1
             
-            # Force output to flush immediately
-            print(f"[BATCH {batch_num}/{total_batches}] Processing {len(batch)} companies...", flush=True)
+            print(f"[JOB {job_id}] BATCH {batch_num}/{total_batches}: Processing {len(batch)} companies...", flush=True)
             sys.stdout.flush()
             
             # Format for SQL IN clause - just the slugs
@@ -483,14 +177,20 @@ def process_companies():
                         writer.writeheader()
                         writer.writerows(all_results)
                 
-                print(f"[BATCH {batch_num}/{total_batches}] Complete: {len(batch_results)} companies with results (Total so far: {len(all_results)})", flush=True)
+                # Update job status
+                with job_lock:
+                    jobs[job_id]['completed_batches'] = batch_num
+                    jobs[job_id]['total_results'] = len(all_results)
+                    jobs[job_id]['partial_file'] = partial_filename
+                
+                print(f"[JOB {job_id}] BATCH {batch_num}/{total_batches}: Complete - {len(batch_results)} results (Total: {len(all_results)})", flush=True)
                 sys.stdout.flush()
                 
                 # Brief pause to be nice to the database
                 time.sleep(0.5)
                 
             except Exception as e:
-                print(f"[BATCH {batch_num}/{total_batches}] ERROR: {e}", flush=True)
+                print(f"[JOB {job_id}] BATCH {batch_num}/{total_batches}: ERROR - {e}", flush=True)
                 sys.stdout.flush()
                 continue
         
@@ -507,29 +207,349 @@ def process_companies():
             if os.path.exists(partial_filepath):
                 os.remove(partial_filepath)
             
-            print(f"[COMPLETE] Processed {total_batches} batches. Final results: {len(all_results)} companies with Sales/BD employees. Saved to {final_filename}", flush=True)
-            sys.stdout.flush()
+            # Update job status
+            with job_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['completed_at'] = datetime.now().isoformat()
+                jobs[job_id]['final_file'] = final_filename
+                jobs[job_id]['total_results'] = len(all_results)
+                if 'partial_file' in jobs[job_id]:
+                    del jobs[job_id]['partial_file']
             
-            return jsonify({
-                'success': True,
-                'total_results': len(all_results),
-                'filename': final_filename,
-                'batches_processed': total_batches
-            })
-        else:
-            print(f"[COMPLETE] Processed {total_batches} batches. No companies found with Sales/BD employees", flush=True)
+            print(f"[JOB {job_id}] COMPLETE: {len(all_results)} companies with Sales/BD employees. Saved to {final_filename}", flush=True)
             sys.stdout.flush()
-            return jsonify({'success': False, 'error': 'No results found'})
+        else:
+            with job_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['completed_at'] = datetime.now().isoformat()
+                jobs[job_id]['error'] = 'No results found'
+            
+            print(f"[JOB {job_id}] COMPLETE: No companies found with Sales/BD employees", flush=True)
+            sys.stdout.flush()
             
     except Exception as e:
-        print(f"[ERROR] Processing failed: {e}", flush=True)
+        with job_lock:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['error'] = str(e)
+            jobs[job_id]['failed_at'] = datetime.now().isoformat()
+        
+        print(f"[JOB {job_id}] FAILED: {e}", flush=True)
         sys.stdout.flush()
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sales/BD Processor</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+        .form-group { margin: 20px 0; }
+        textarea { width: 100%; height: 200px; }
+        button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
+        .section { margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 4px; }
+        .status { font-family: monospace; white-space: pre-wrap; }
+        .example { background: #e9ecef; padding: 10px; border-radius: 4px; margin: 10px 0; font-family: monospace; }
+        .job-info { margin: 10px 0; padding: 10px; background: white; border-radius: 3px; }
+        .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; margin: 10px 0; }
+        .progress-fill { height: 100%; background: #007bff; border-radius: 10px; transition: width 0.3s; }
+    </style>
+</head>
+<body>
+    <h1>Sales/BD Employee Counter</h1>
+    <p>Process companies in batches to count Sales and Business Development employees.</p>
+    
+    <div class="section">
+        <h3>Start New Job</h3>
+        <form id="jobForm">
+            <div class="form-group">
+                <label>Input Format:</label>
+                <div>
+                    <input type="radio" id="slugsOnly" name="inputFormat" value="slugs" checked>
+                    <label for="slugsOnly">Company slugs only (one per line)</label>
+                </div>
+                <div>
+                    <input type="radio" id="csvFormat" name="inputFormat" value="csv">
+                    <label for="csvFormat">CSV format: hubspot_company_id,slug</label>
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label>Company Data:</label>
+                <div class="example" id="slugExample">
+                    Example (slugs only):
+                    nooksapp
+                    hubspot
+                    salesforce
+                </div>
+                <div class="example" id="csvExample" style="display:none;">
+                    Example (CSV format):
+                    12345,nooksapp
+                    67890,hubspot
+                    11111,salesforce
+                </div>
+                <textarea id="companies" placeholder="Enter your company data here..."></textarea>
+            </div>
+            
+            <div class="form-group">
+                <label>Batch Size:</label>
+                <input type="number" id="batchSize" value="500" min="100" max="2000">
+                <small>Smaller batches = more reliable processing</small>
+            </div>
+            <button type="submit">Start Background Job</button>
+        </form>
+    </div>
+    
+    <div class="section">
+        <h3>Job Status</h3>
+        <button onclick="checkStatus()">Refresh Status</button>
+        <button onclick="downloadLatest()">Download Latest CSV</button>
+        <div id="jobStatus">Click "Refresh Status" to check current jobs</div>
+    </div>
+
+    <script>
+        let currentJobId = localStorage.getItem('currentJobId');
+
+        // Toggle examples based on input format
+        document.querySelectorAll('input[name="inputFormat"]').forEach(radio => {
+            radio.addEventListener('change', function() {
+                if (this.value === 'slugs') {
+                    document.getElementById('slugExample').style.display = 'block';
+                    document.getElementById('csvExample').style.display = 'none';
+                    document.getElementById('companies').placeholder = 'nooksapp\\nhubspot\\nsalesforce\\n...';
+                } else {
+                    document.getElementById('slugExample').style.display = 'none';
+                    document.getElementById('csvExample').style.display = 'block';
+                    document.getElementById('companies').placeholder = '12345,nooksapp\\n67890,hubspot\\n11111,salesforce\\n...';
+                }
+            });
+        });
+
+        function checkStatus() {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    const container = document.getElementById('jobStatus');
+                    if (data.jobs && data.jobs.length > 0) {
+                        container.innerHTML = data.jobs.map(job => {
+                            let statusHtml = `<div class="job-info">
+                                <strong>Job ${job.id.substring(0, 8)}...</strong> - ${job.status.toUpperCase()}
+                                <br>Companies: ${job.total_companies || 'N/A'}
+                                <br>Created: ${new Date(job.created_at).toLocaleString()}`;
+                            
+                            if (job.status === 'processing') {
+                                const progress = job.total_batches > 0 ? Math.round((job.completed_batches / job.total_batches) * 100) : 0;
+                                statusHtml += `<br>Progress: ${job.completed_batches}/${job.total_batches} batches (${progress}%)
+                                    <div class="progress-bar"><div class="progress-fill" style="width: ${progress}%"></div></div>
+                                    <br>Results so far: ${job.total_results || 0}`;
+                            }
+                            
+                            if (job.status === 'completed' && job.final_file) {
+                                statusHtml += `<br>Results: ${job.total_results} companies
+                                    <br><a href="/download-csv/${job.final_file}" download>Download Final CSV</a>`;
+                            }
+                            
+                            if (job.status === 'processing' && job.partial_file) {
+                                statusHtml += `<br><a href="/download-csv/${job.partial_file}" download>Download Partial Results</a>`;
+                            }
+                            
+                            if (job.error) {
+                                statusHtml += `<br><span style="color: red;">Error: ${job.error}</span>`;
+                            }
+                            
+                            statusHtml += '</div>';
+                            return statusHtml;
+                        }).join('');
+                    } else {
+                        container.innerHTML = '<em>No jobs found</em>';
+                    }
+                })
+                .catch(error => {
+                    document.getElementById('jobStatus').innerHTML = '<em>Error loading status</em>';
+                });
+        }
+
+        function downloadLatest() {
+            window.open('/download-latest', '_blank');
+        }
+        
+        document.getElementById('jobForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const inputFormat = document.querySelector('input[name="inputFormat"]:checked').value;
+            const inputData = document.getElementById('companies').value.trim();
+            const batchSize = parseInt(document.getElementById('batchSize').value);
+            
+            if (!inputData) {
+                alert('Please enter company data');
+                return;
+            }
+            
+            // Parse input based on format
+            let companies = [];
+            if (inputFormat === 'slugs') {
+                companies = inputData.split('\\n').filter(line => line.trim()).map(slug => ({slug: slug.trim()}));
+            } else {
+                companies = inputData.split('\\n').filter(line => line.trim()).map(line => {
+                    const [hubspot_id, slug] = line.split(',').map(s => s.trim());
+                    return {hubspot_company_id: hubspot_id, slug: slug};
+                });
+            }
+            
+            if (companies.length === 0) {
+                alert('No valid company data found');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/start-job', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ companies, batch_size: batchSize, input_format: inputFormat })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    currentJobId = result.job_id;
+                    localStorage.setItem('currentJobId', currentJobId);
+                    alert(`Job started! Job ID: ${currentJobId.substring(0, 8)}...\\nProcessing ${companies.length} companies in the background.`);
+                    checkStatus(); // Refresh status immediately
+                } else {
+                    alert('Error starting job: ' + result.error);
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        });
+
+        // Auto-refresh status every 10 seconds if there's an active job
+        setInterval(() => {
+            if (currentJobId) {
+                checkStatus();
+            }
+        }, 10000);
+
+        // Load status on page load
+        window.onload = function() {
+            checkStatus();
+        };
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/test-connection')
+def test_connection():
+    """Test database connection"""
+    try:
+        db_config = get_db_config()
+        conn = psycopg2.connect(**db_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        result = cursor.fetchone()
+        conn.close()
+        return jsonify({'success': True, 'message': 'Database connection successful'})
+    except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
-# Legacy download endpoint for backward compatibility
-@app.route('/download/<filename>')
-def download_file(filename):
-    return download_saved_file(filename)
+@app.route('/start-job', methods=['POST'])
+def start_job():
+    """Start a background processing job"""
+    try:
+        data = request.json
+        companies = data['companies']
+        batch_size = data.get('batch_size', 500)
+        input_format = data.get('input_format', 'slugs')
+        
+        # Generate unique job ID
+        job_id = str(uuid.uuid4())
+        
+        # Store job info
+        with job_lock:
+            jobs[job_id] = {
+                'id': job_id,
+                'status': 'queued',
+                'created_at': datetime.now().isoformat(),
+                'total_companies': len(companies),
+                'batch_size': batch_size,
+                'input_format': input_format
+            }
+        
+        # Start background thread
+        thread = threading.Thread(
+            target=process_companies_background,
+            args=(job_id, companies, batch_size, input_format)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'message': f'Job started processing {len(companies)} companies in background'
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/status')
+def get_status():
+    """Get status of all jobs"""
+    try:
+        with job_lock:
+            job_list = list(jobs.values())
+        
+        # Sort by creation time, newest first
+        job_list.sort(key=lambda x: x['created_at'], reverse=True)
+        
+        return jsonify({
+            'success': True,
+            'jobs': job_list
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'jobs': []})
+
+@app.route('/download-csv/<filename>')
+def download_csv(filename):
+    """Download a specific CSV file"""
+    try:
+        filepath = os.path.join('/data', filename)
+        if not os.path.exists(filepath) or not filename.endswith('.csv'):
+            return 'File not found', 404
+            
+        with open(filepath, 'r') as f:
+            content = f.read()
+        
+        return content, 200, {
+            'Content-Type': 'text/csv',
+            'Content-Disposition': f'attachment; filename={filename}'
+        }
+    except Exception as e:
+        return f'Error reading file: {e}', 500
+
+@app.route('/download-latest')
+def download_latest():
+    """Download the most recent CSV file"""
+    try:
+        data_dir = '/data'
+        if not os.path.exists(data_dir):
+            return 'No files found', 404
+        
+        csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+        if not csv_files:
+            return 'No CSV files found', 404
+        
+        # Get most recent file
+        latest_file = max(csv_files, key=lambda f: os.path.getctime(os.path.join(data_dir, f)))
+        
+        return download_csv(latest_file)
+        
+    except Exception as e:
+        return f'Error: {e}', 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
