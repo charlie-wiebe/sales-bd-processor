@@ -7,6 +7,7 @@ import io
 import tempfile
 import base64
 import csv
+import sys
 
 app = Flask(__name__)
 
@@ -100,6 +101,9 @@ HTML_TEMPLATE = """
         .progress { margin: 10px 0; }
         .status { font-family: monospace; white-space: pre-wrap; }
         .example { background: #e9ecef; padding: 10px; border-radius: 4px; margin: 10px 0; font-family: monospace; }
+        .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; margin: 10px 0; }
+        .progress-fill { height: 100%; background: #007bff; border-radius: 10px; transition: width 0.3s; }
+        .download-section { margin: 20px 0; padding: 15px; background: #d4edda; border-radius: 4px; }
     </style>
 </head>
 <body>
@@ -146,12 +150,23 @@ HTML_TEMPLATE = """
     
     <div id="results" class="results" style="display:none;">
         <h3>Processing Status</h3>
+        <div class="progress-bar">
+            <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <div id="progressText">0% complete (0 / 0 batches)</div>
         <div id="status" class="status"></div>
-        <div id="progress"></div>
-        <div id="downloadLink"></div>
+        <div id="downloadSection" class="download-section" style="display:none;">
+            <strong>Partial Results Available:</strong>
+            <div id="downloadLink"></div>
+        </div>
     </div>
 
     <script>
+        let currentResults = [];
+        let totalBatches = 0;
+        let completedBatches = 0;
+        let isProcessing = false;
+
         // Toggle examples based on input format
         document.querySelectorAll('input[name="inputFormat"]').forEach(radio => {
             radio.addEventListener('change', function() {
@@ -166,9 +181,55 @@ HTML_TEMPLATE = """
                 }
             });
         });
+
+        function updateProgress(completed, total, message) {
+            const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
+            document.getElementById('progressFill').style.width = percentage + '%';
+            document.getElementById('progressText').textContent = 
+                `${percentage}% complete (${completed} / ${total} batches)`;
+            
+            if (message) {
+                document.getElementById('status').textContent += message + '\\n';
+            }
+        }
+
+        function savePartialResults() {
+            if (currentResults.length > 0) {
+                const filename = `partial_results_${Date.now()}.csv`;
+                const csvContent = convertToCSV(currentResults);
+                const blob = new Blob([csvContent], { type: 'text/csv' });
+                const url = window.URL.createObjectURL(blob);
+                
+                document.getElementById('downloadSection').style.display = 'block';
+                document.getElementById('downloadLink').innerHTML = 
+                    `<a href="${url}" download="${filename}">Download Partial Results (${currentResults.length} companies)</a>`;
+            }
+        }
+
+        function convertToCSV(data) {
+            if (data.length === 0) return '';
+            
+            const headers = Object.keys(data[0]);
+            const csvRows = [headers.join(',')];
+            
+            for (const row of data) {
+                const values = headers.map(header => {
+                    const value = row[header] || '';
+                    return typeof value === 'string' && value.includes(',') ? `"${value}"` : value;
+                });
+                csvRows.push(values.join(','));
+            }
+            
+            return csvRows.join('\\n');
+        }
         
         document.getElementById('processForm').addEventListener('submit', async (e) => {
             e.preventDefault();
+            
+            if (isProcessing) {
+                alert('Processing already in progress. Please wait or refresh the page to start over.');
+                return;
+            }
             
             const inputFormat = document.querySelector('input[name="inputFormat"]:checked').value;
             const inputData = document.getElementById('companies').value.trim();
@@ -195,8 +256,16 @@ HTML_TEMPLATE = """
                 return;
             }
             
+            // Reset state
+            currentResults = [];
+            totalBatches = Math.ceil(companies.length / batchSize);
+            completedBatches = 0;
+            isProcessing = true;
+            
             document.getElementById('results').style.display = 'block';
-            document.getElementById('status').innerHTML = `Processing ${companies.length} companies in batches of ${batchSize}...\\n`;
+            document.getElementById('downloadSection').style.display = 'none';
+            document.getElementById('status').textContent = `Starting processing of ${companies.length} companies in ${totalBatches} batches...\\n`;
+            updateProgress(0, totalBatches);
             
             try {
                 const response = await fetch('/process', {
@@ -208,13 +277,27 @@ HTML_TEMPLATE = """
                 const result = await response.json();
                 
                 if (result.success) {
-                    document.getElementById('status').innerHTML += `\\nComplete! Found ${result.total_results} companies with Sales/BD employees.`;
-                    document.getElementById('downloadLink').innerHTML = `<a href="/download/${result.filename}" download>Download Results CSV</a>`;
+                    updateProgress(totalBatches, totalBatches, `\\nComplete! Found ${result.total_results} companies with Sales/BD employees.`);
+                    document.getElementById('downloadLink').innerHTML = `<a href="/download/${result.filename}" download>Download Final Results CSV</a>`;
+                    document.getElementById('downloadSection').style.display = 'block';
                 } else {
-                    document.getElementById('status').innerHTML += `\\nError: ${result.error}`;
+                    updateProgress(completedBatches, totalBatches, `\\nError: ${result.error}`);
+                    savePartialResults();
                 }
             } catch (error) {
-                document.getElementById('status').innerHTML += `\\nError: ${error.message}`;
+                updateProgress(completedBatches, totalBatches, `\\nError: ${error.message}`);
+                savePartialResults();
+            } finally {
+                isProcessing = false;
+            }
+        });
+
+        // Handle page unload
+        window.addEventListener('beforeunload', function(e) {
+            if (isProcessing) {
+                e.preventDefault();
+                e.returnValue = 'Processing is still in progress. Are you sure you want to leave?';
+                return e.returnValue;
             }
         });
     </script>
@@ -257,13 +340,16 @@ def process_companies():
             for company in companies:
                 slug_to_hubspot_id[company['slug']] = company['hubspot_company_id']
         
+        total_batches = (len(companies) + batch_size - 1) // batch_size
+        
         # Process in batches
         for i in range(0, len(companies), batch_size):
             batch = companies[i:i+batch_size]
             batch_num = (i // batch_size) + 1
-            total_batches = (len(companies) + batch_size - 1) // batch_size
             
-            print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} companies)")
+            # Force output to flush immediately
+            print(f"[BATCH {batch_num}/{total_batches}] Processing {len(batch)} companies...", flush=True)
+            sys.stdout.flush()
             
             # Format for SQL IN clause - just the slugs
             slug_list = "'" + "', '".join([company['slug'] for company in batch]) + "'"
@@ -293,35 +379,46 @@ def process_companies():
                 all_results.extend(batch_results)
                 conn.close()
                 
-                print(f"Batch {batch_num} complete: {len(batch_results)} companies with results")
-                time.sleep(0.5)  # Be nice to the database
+                print(f"[BATCH {batch_num}/{total_batches}] Complete: {len(batch_results)} companies with results (Total so far: {len(all_results)})", flush=True)
+                sys.stdout.flush()
+                
+                # Brief pause to be nice to the database
+                time.sleep(0.5)
                 
             except Exception as e:
-                print(f"Error in batch {batch_num}: {e}")
+                print(f"[BATCH {batch_num}/{total_batches}] ERROR: {e}", flush=True)
+                sys.stdout.flush()
                 continue
         
-        # Combine all results and save to CSV
+        # Save results to CSV
         if all_results:
             filename = f'sales_bd_results_{int(time.time())}.csv'
             filepath = f'/tmp/{filename}'
             
             # Write CSV manually
             with open(filepath, 'w', newline='') as csvfile:
-                if all_results:
-                    fieldnames = all_results[0].keys()
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(all_results)
+                fieldnames = all_results[0].keys()
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(all_results)
+            
+            print(f"[COMPLETE] Processed {total_batches} batches. Final results: {len(all_results)} companies with Sales/BD employees", flush=True)
+            sys.stdout.flush()
             
             return jsonify({
                 'success': True,
                 'total_results': len(all_results),
-                'filename': filename
+                'filename': filename,
+                'batches_processed': total_batches
             })
         else:
+            print(f"[COMPLETE] Processed {total_batches} batches. No companies found with Sales/BD employees", flush=True)
+            sys.stdout.flush()
             return jsonify({'success': False, 'error': 'No results found'})
             
     except Exception as e:
+        print(f"[ERROR] Processing failed: {e}", flush=True)
+        sys.stdout.flush()
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/download/<filename>')
