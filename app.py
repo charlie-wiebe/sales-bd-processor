@@ -1354,18 +1354,10 @@ HTML_TEMPLATE = """
     </div>
     
     <div class="section">
-        <h3>Start New Job</h3>
+        <h3>Start New Job (Gets Both Sales/BD + SDR/BDR Counts)</h3>
         <form id="jobForm">
             <div class="form-group">
-                <label>Job Type:</label>
-                <div>
-                    <input type="radio" id="salesBdJob" name="jobType" value="sales_bd" checked>
-                    <label for="salesBdJob">Sales/BD Count (uses job function tags)</label>
-                </div>
-                <div>
-                    <input type="radio" id="sdrJob" name="jobType" value="sdr">
-                    <label for="sdrJob">SDR/BDR Count (title-based matching)</label>
-                </div>
+                <p><strong>✅ Master Query:</strong> Gets both Sales/BD count (tag-based) AND SDR/BDR count (title-based) in one optimized run!</p>
             </div>
             
             <div class="form-group">
@@ -1527,7 +1519,6 @@ HTML_TEMPLATE = """
             e.preventDefault();
             
             const inputFormat = document.querySelector('input[name="inputFormat"]:checked').value;
-            const jobType = document.querySelector('input[name="jobType"]:checked').value;
             const inputData = document.getElementById('companies').value.trim();
             const batchSize = parseInt(document.getElementById('batchSize').value);
             
@@ -1553,8 +1544,8 @@ HTML_TEMPLATE = """
             }
             
             try {
-                // Choose endpoint based on job type
-                const endpoint = jobType === 'sdr' ? '/start-sdr-job' : '/start-job';
+                // Use master query endpoint for both metrics
+                const endpoint = '/start-job';
                 const requestBody = { 
                     companies, 
                     batch_size: batchSize, 
@@ -1707,56 +1698,12 @@ def start_job():
         sys.stdout.flush()
         return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/start-sdr-job', methods=['POST'])
-def start_sdr_job():
-    """Start an individual SDR processing job with smart resume"""
-    try:
-        data = request.json
-        companies = data['companies']
-        input_format = data.get('input_format', 'slugs')
-        
-        # Generate unique job ID
-        job_id = str(uuid.uuid4())
-        
-        print(f"[API] Starting SDR job {job_id} for {len(companies)} companies", flush=True)
-        sys.stdout.flush()
-        
-        # Get processor stats
-        stats = processor.get_stats()
-        
-        # Store job info
-        with job_lock:
-            jobs[job_id] = {
-                'id': job_id,
-                'type': 'sdr',  # Mark as SDR job
-                'status': 'queued',
-                'created_at': datetime.now().isoformat(),
-                'total_companies': len(companies),
-                'input_format': input_format,
-                'processing_mode': 'individual_sdr'
-            }
-        
-        # Start background thread for SDR processing
-        thread = threading.Thread(
-            target=process_companies_individual_sdr,
-            args=(job_id, companies, input_format)
-        )
-        thread.daemon = True
-        thread.start()
-        
-        return jsonify({
-            'success': True,
-            'job_id': job_id,
-            'message': f'Individual SDR processing job started for {len(companies)} companies',
-            'processing_mode': 'individual_sdr',
-            'smart_resume': True,
-            'job_type': 'sdr'
-        })
-        
-    except Exception as e:
-        print(f"[API] Error starting SDR job: {e}", flush=True)
-        sys.stdout.flush()
-        return jsonify({'success': False, 'error': str(e)})
+# DEPRECATED: SDR endpoint - now using master query in /start-job for both metrics
+# @app.route('/start-sdr-job', methods=['POST'])
+# def start_sdr_job():
+#     """DEPRECATED: Start an individual SDR processing job with smart resume
+#     Now using master query in /start-job endpoint for both metrics"""
+#     pass
 
 @app.route('/status')
 def get_status():
