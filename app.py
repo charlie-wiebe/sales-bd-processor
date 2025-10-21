@@ -563,12 +563,12 @@ class SmartSalesBDProcessor:
                     else:
                         jobs[job_id]['current_batch'] = f"Batch {batch_num}/{total_batches}"
                 
-                # Save progress every 10 companies
-                if i % 10 == 0:
+                # Save progress every 10 companies processed
+                if (i + len(batch)) % 10 == 0:
                     self._save_progress()
                     elapsed = time.time() - start_time
-                    rate = i / elapsed * 60  # companies per minute
-                    logger.info(f"[{job_id}] Progress: {i}/{len(unprocessed)} ({i/len(unprocessed)*100:.1f}%) - Rate: {rate:.1f} companies/min")
+                    rate = (i + len(batch)) / elapsed * 60  # companies per minute
+                    logger.info(f"[{job_id}] Progress: {i + len(batch)}/{len(unprocessed)} companies processed ({(i + len(batch))/len(unprocessed)*100:.1f}%) - Rate: {rate:.1f} companies/min")
                 
                 # Brief pause to be nice to the database
                 time.sleep(0.1)
@@ -1406,7 +1406,7 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
-        let currentJobId = localStorage.getItem('currentJobId');
+        let currentJobId = null; // Removed localStorage smart pickup
 
         // Toggle examples based on input format
         document.querySelectorAll('input[name="inputFormat"]').forEach(radio => {
@@ -1473,10 +1473,12 @@ HTML_TEMPLATE = """
                                 <br>Created: ${new Date(job.created_at).toLocaleString()}`;
                             
                             if (job.status === 'processing') {
-                                const progress = job.total_batches > 0 ? Math.round((job.completed_batches / job.total_batches) * 100) : 0;
-                                statusHtml += `<br>Progress: ${job.completed_batches}/${job.total_batches} batches (${progress}%)
+                                const processed = job.processed_count || 0;
+                                const total = job.total_companies || 0;
+                                const progress = total > 0 ? Math.round((processed / total) * 100) : 0;
+                                statusHtml += `<br>Progress: ${processed}/${total} companies (${progress}%)
                                     <div class="progress-bar"><div class="progress-fill" style="width: ${progress}%"></div></div>
-                                    <br>Results so far: ${job.total_results || 0}`;
+                                    <br>Successful: ${job.total_successful || 0} | Failed: ${job.total_failed || 0}`;
                             }
                             
                             if (job.status === 'completed' && job.final_file) {
@@ -1563,7 +1565,7 @@ HTML_TEMPLATE = """
                 
                 if (result.success) {
                     currentJobId = result.job_id;
-                    localStorage.setItem('currentJobId', currentJobId);
+                    // Removed localStorage.setItem - no more smart pickup
                     const processingMode = batchSize === 1 ? 'Individual' : `Batch (${batchSize})`;
                     alert(`Job started! Job ID: ${currentJobId.substring(0, 8)}...\nProcessing ${companies.length} companies with ${processingMode} processing.\nWill get both Sales/BD and SDR/BDR counts.`);
                     checkStatus(); // Refresh status immediately
