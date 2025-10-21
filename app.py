@@ -393,7 +393,7 @@ class SmartSalesBDProcessor:
                     logger.info(f"[{job_id}] [Batch {batch_num}/{total_batches}] Processing {len(batch)} companies: {', '.join(slugs[:3])}{'...' if len(batch) > 3 else ''}")
                 
                 # Process batch using new method with master query
-                batch_results = self.process_companies_batch(batch, batch_size=batch_size, use_master_query=True)
+                batch_results = self.process_companies_batch(batch, batch_size=batch_size)
                 
                 # Save results and update counters
                 for result in batch_results:
@@ -433,8 +433,9 @@ class SmartSalesBDProcessor:
                 time.sleep(0.1)
                 
             except Exception as e:
-                logger.error(f"[{job_id}] Unexpected error processing {slug}: {e}")
-                self.total_failed += 1
+                batch_slugs = [c.get('slug', 'unknown') for c in batch]
+                logger.error(f"[{job_id}] Unexpected error processing batch {batch_slugs}: {e}")
+                self.total_failed += len(batch)
                 continue
         
         # Generate final CSV
