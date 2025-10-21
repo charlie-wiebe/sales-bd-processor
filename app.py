@@ -80,7 +80,7 @@ FROM (
     LEFT JOIN company_position3 cp3 ON cp3.linkedin_profile_position3_id = lpp3.id
     LEFT JOIN job_title jt ON cp3.job_title_id = jt.id
     WHERE lcs.slug IN ({})
-      AND lcs.slug_status = 'A'
+      AND lc.slug_status = 'A'
       AND lp.slug_status = 'A'
       AND lpp3.is_current = true
       AND lpp3.obsolete = false
