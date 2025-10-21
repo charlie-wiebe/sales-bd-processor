@@ -1023,8 +1023,16 @@ final_results AS (
                   AND (
                       lpp3_prior.title ILIKE 'sdr' OR lpp3_prior.title ILIKE 'bdr'
                       OR lpp3_prior.title ILIKE 'senior sdr' OR lpp3_prior.title ILIKE 'senior bdr'
+                      OR lpp3_prior.title ILIKE 'associate sdr' OR lpp3_prior.title ILIKE 'associate bdr'
+                      OR lpp3_prior.title ILIKE 'junior sdr' OR lpp3_prior.title ILIKE 'junior bdr'
                       OR lpp3_prior.title ILIKE '%sales development representative%'
                       OR lpp3_prior.title ILIKE '%business development representative%'
+                      OR lpp3_prior.title ILIKE '%business development%'
+                      OR lpp3_prior.title ILIKE '%sales development%'
+                      OR lpp3_prior.title ILIKE '%account development representative%'
+                      OR lpp3_prior.title ILIKE '%account development%'
+                      OR lpp3_prior.title ILIKE '%sales development associate%'
+                      OR lpp3_prior.title ILIKE '%inside sales representative%'
                   )
                   AND NOT (
                       lpp3_prior.title ILIKE '%manager%' OR lpp3_prior.title ILIKE '%director%'
@@ -1177,8 +1185,16 @@ final_sdrs AS (
             AND (
                 lpp3_prior.title ILIKE 'sdr' OR lpp3_prior.title ILIKE 'bdr'
                 OR lpp3_prior.title ILIKE 'senior sdr' OR lpp3_prior.title ILIKE 'senior bdr'
+                OR lpp3_prior.title ILIKE 'associate sdr' OR lpp3_prior.title ILIKE 'associate bdr'
+                OR lpp3_prior.title ILIKE 'junior sdr' OR lpp3_prior.title ILIKE 'junior bdr'
                 OR lpp3_prior.title ILIKE '%sales development representative%'
                 OR lpp3_prior.title ILIKE '%business development representative%'
+                OR lpp3_prior.title ILIKE '%business development%'
+                OR lpp3_prior.title ILIKE '%sales development%'
+                OR lpp3_prior.title ILIKE '%account development representative%'
+                OR lpp3_prior.title ILIKE '%account development%'
+                OR lpp3_prior.title ILIKE '%sales development associate%'
+                OR lpp3_prior.title ILIKE '%inside sales representative%'
             )
             AND NOT (
                 lpp3_prior.title ILIKE '%manager%' OR lpp3_prior.title ILIKE '%director%'
