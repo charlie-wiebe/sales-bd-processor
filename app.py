@@ -733,7 +733,8 @@ HTML_TEMPLATE = """
                 if (result.success) {
                     currentJobId = result.job_id;
                     localStorage.setItem('currentJobId', currentJobId);
-                    alert(`Job started! Job ID: ${currentJobId.substring(0, 8)}...\\nProcessing ${companies.length} companies in the background.`);
+                    const jobTypeLabel = jobType === 'sdr' ? 'SDR/BDR' : 'Sales/BD';
+                    alert(`${jobTypeLabel} Job started! Job ID: ${currentJobId.substring(0, 8)}...\nProcessing ${companies.length} companies in the background.`);
                     checkStatus(); // Refresh status immediately
                 } else {
                     alert('Error starting job: ' + result.error);
