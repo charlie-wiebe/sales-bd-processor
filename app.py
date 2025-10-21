@@ -1211,7 +1211,7 @@ FULL OUTER JOIN deduplicated_sdrs sdr ON sb.slug = sdr.slug
 GROUP BY COALESCE(sb.slug, sdr.slug);
 """
 
-def process_companies_individual(job_id, companies, input_format):
+def process_companies_individual(job_id, companies, input_format, batch_size=1):
     """Individual processing function with smart resume and deduplication"""
     try:
         print(f"[JOB {job_id}] START: Individual processing of {len(companies)} companies", flush=True)
@@ -1248,9 +1248,7 @@ def process_companies_individual(job_id, companies, input_format):
                     'hubspot_company_id': ''
                 })
         
-        # Get batch size from request (default to 1 for individual processing)
-        batch_size = int(request.json.get('batch_size', 1))
-        
+        # Use batch_size parameter (passed from API endpoint)
         # Process all companies with configurable batch size
         processor.process_all_with_batch(formatted_companies, job_id, batch_size)
         
@@ -1268,7 +1266,7 @@ def process_companies_individual(job_id, companies, input_format):
         print(f"[JOB {job_id}] TRACEBACK: {traceback_msg}", flush=True)
         sys.stdout.flush()
 
-def process_companies_individual_sdr(job_id, companies, input_format):
+def process_companies_individual_sdr(job_id, companies, input_format, batch_size=1):
     """Individual SDR processing function with smart resume and deduplication"""
     try:
         print(f"[JOB {job_id}] START: Individual SDR processing of {len(companies)} companies", flush=True)
@@ -1305,9 +1303,7 @@ def process_companies_individual_sdr(job_id, companies, input_format):
                     'hubspot_company_id': ''
                 })
         
-        # Get batch size from request (default to 1 for individual processing)
-        batch_size = int(request.json.get('batch_size', 1))
-        
+        # Use batch_size parameter (passed from API endpoint)
         # Process all companies for SDR count with configurable batch size
         processor.process_all_with_batch(formatted_companies, job_id, batch_size)
         
@@ -1676,10 +1672,13 @@ def start_job():
                 'previous_stats': stats
             }
         
+        # Get batch size from request
+        batch_size = int(data.get('batch_size', 1))
+        
         # Start background thread with individual processing
         thread = threading.Thread(
             target=process_companies_individual,
-            args=(job_id, companies, input_format)
+            args=(job_id, companies, input_format, batch_size)
         )
         thread.daemon = True
         thread.start()
