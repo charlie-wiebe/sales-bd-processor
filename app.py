@@ -247,135 +247,9 @@ class SmartSalesBDProcessor:
                 error_message=str(e)
             )
     
-    def process_single_company(self, company: Dict[str, Any]) -> ProcessingResult:
-        """Process a single company with sales/BD query only (legacy method)"""
-        slug = company.get('slug', 'unknown')
-        hubspot_id = company.get('hubspot_company_id', '')
-        
-        start_time = time.time()
-        
-        try:
-            logger.debug(f"Processing company {slug} for sales/BD count")
-            
-            # Execute the sales BD query for this single company
-            conn = psycopg2.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            # Set query timeout
-            cursor.execute("SET statement_timeout = '30s'")
-            
-            # Use the existing query template for single company
-            query = QUERY_TEMPLATE.format(f"'{slug}'")
-            cursor.execute(query)
-            
-            result = cursor.fetchone()
-            conn.close()
-            
-            processing_time = time.time() - start_time
-            
-            if result:
-                sales_bd_count = result[1]  # Second column is the count
-                return ProcessingResult(
-                    company_slug=slug,
-                    company_name=slug,  # Using slug as name for now
-                    hubspot_company_id=hubspot_id,
-                    processed_at=datetime.now().isoformat(),
-                    processing_time_seconds=processing_time,
-                    success=True,
-                    sales_bd_count=sales_bd_count,
-                    sdr_bdr_count=0  # Not calculated in this method
-                )
-            else:
-                return ProcessingResult(
-                    company_slug=slug,
-                    company_name=slug,
-                    hubspot_company_id=hubspot_id,
-                    processed_at=datetime.now().isoformat(),
-                    processing_time_seconds=processing_time,
-                    success=True,
-                    sales_bd_count=0,
-                    sdr_bdr_count=0
-                )
-            
-        except Exception as e:
-            processing_time = time.time() - start_time
-            logger.error(f"Failed to process company {slug}: {e}")
-            
-            return ProcessingResult(
-                company_slug=slug,
-                company_name=slug,
-                hubspot_company_id=hubspot_id,
-                processed_at=datetime.now().isoformat(),
-                processing_time_seconds=processing_time,
-                success=False,
-                error_message=str(e)
-            )
     
-    def process_single_company_sdr(self, company: Dict[str, Any]) -> ProcessingResult:
-        """Process a single company with SDR/BDR database query only (legacy method)"""
-        slug = company.get('slug', 'unknown')
-        hubspot_id = company.get('hubspot_company_id', '')
-        
-        start_time = time.time()
-        
-        try:
-            logger.debug(f"Processing company {slug} for SDR count")
-            
-            # Execute the SDR query for this single company
-            conn = psycopg2.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            # Set query timeout
-            cursor.execute("SET statement_timeout = '30s'")
-            
-            # Use the SDR query template for single company
-            query = SDR_QUERY_TEMPLATE.format(f"'{slug}'")
-            cursor.execute(query)
-            
-            result = cursor.fetchone()
-            conn.close()
-            
-            processing_time = time.time() - start_time
-            
-            if result:
-                sdr_bdr_count = result[1]  # Second column is the count
-                return ProcessingResult(
-                    company_slug=slug,
-                    company_name=slug,  # Using slug as name for now
-                    hubspot_company_id=hubspot_id,
-                    processed_at=datetime.now().isoformat(),
-                    processing_time_seconds=processing_time,
-                    success=True,
-                    sales_bd_count=0,  # Not calculated in this method
-                    sdr_bdr_count=sdr_bdr_count
-                )
-            else:
-                return ProcessingResult(
-                    company_slug=slug,
-                    company_name=slug,
-                    hubspot_company_id=hubspot_id,
-                    processed_at=datetime.now().isoformat(),
-                    processing_time_seconds=processing_time,
-                    success=True,
-                    sales_bd_count=0,
-                    sdr_bdr_count=0
-                )
-            
-        except Exception as e:
-            processing_time = time.time() - start_time
-            logger.error(f"Failed to process company {slug} for SDR count: {e}")
-            
-            return ProcessingResult(
-                company_slug=slug,
-                company_name=slug,
-                hubspot_company_id=hubspot_id,
-                processed_at=datetime.now().isoformat(),
-                processing_time_seconds=processing_time,
-                success=False,
-                error_message=str(e)
-            )
     
-    def process_companies_batch(self, companies: List[Dict[str, Any]], batch_size: int = 1, use_master_query: bool = True) -> List[ProcessingResult]:
+    def process_companies_batch(self, companies: List[Dict[str, Any]], batch_size: int = 1) -> List[ProcessingResult]:
         """Process companies in batches with configurable batch size"""
         results = []
         
@@ -384,22 +258,19 @@ class SmartSalesBDProcessor:
             batch = companies[i:i + batch_size]
             
             if batch_size == 1:
-                # Individual processing - use master query for both metrics
+                # Individual processing - always use master query for both metrics
                 company = batch[0]
-                if use_master_query:
-                    result = self.process_single_company_master(company)
-                else:
-                    result = self.process_single_company(company)
+                result = self.process_single_company_master(company)
                 results.append(result)
             else:
                 # Batch processing - use batch query
-                batch_results = self._process_batch_query(batch, use_master_query)
+                batch_results = self._process_batch_query(batch)
                 results.extend(batch_results)
         
         return results
     
-    def _process_batch_query(self, companies: List[Dict[str, Any]], use_master_query: bool = True) -> List[ProcessingResult]:
-        """Process a batch of companies with a single database query"""
+    def _process_batch_query(self, companies: List[Dict[str, Any]]) -> List[ProcessingResult]:
+        """Process a batch of companies with master query"""
         if not companies:
             return []
         
@@ -417,13 +288,8 @@ class SmartSalesBDProcessor:
             timeout = min(300, 30 + (len(companies) * 5))  # 30s base + 5s per company, max 5 minutes
             cursor.execute(f"SET statement_timeout = '{timeout}s'")
             
-            if use_master_query:
-                # Use master query for both metrics
-                query = MASTER_QUERY_TEMPLATE.format(f"'{slug_list}'")
-            else:
-                # Use sales/BD query only
-                query = QUERY_TEMPLATE.format(f"'{slug_list}'")
-            
+            # Always use master query for both metrics
+            query = MASTER_QUERY_TEMPLATE.format(f"'{slug_list}'")
             cursor.execute(query)
             query_results = cursor.fetchall()
             conn.close()
@@ -434,18 +300,11 @@ class SmartSalesBDProcessor:
             result_map = {}
             for row in query_results:
                 slug = row[0]
-                if use_master_query:
-                    # Master query: slug, sales_bd_count, sdr_bdr_count
-                    result_map[slug] = {
-                        'sales_bd_count': row[1] if row[1] is not None else 0,
-                        'sdr_bdr_count': row[2] if row[2] is not None else 0
-                    }
-                else:
-                    # Sales/BD query: slug, sales_bd_count
-                    result_map[slug] = {
-                        'sales_bd_count': row[1] if row[1] is not None else 0,
-                        'sdr_bdr_count': 0
-                    }
+                # Master query: slug, sales_bd_count, sdr_bdr_count
+                result_map[slug] = {
+                    'sales_bd_count': row[1] if row[1] is not None else 0,
+                    'sdr_bdr_count': row[2] if row[2] is not None else 0
+                }
             
             # Create ProcessingResult for each company
             results = []
@@ -594,194 +453,14 @@ class SmartSalesBDProcessor:
         logger.info(f"[{job_id}] 🎉 Individual processing complete!")
         logger.info(f"[{job_id}] 📊 Stats: {self.total_successful} successful, {self.total_failed} failed, {elapsed:.1f}s total")
     
-    def process_all_individual_sdr(self, companies: list, job_id: str):
-        """Process all companies individually for SDR/BDR count with smart resume"""
-        
-        # Setup SDR-specific file paths
-        sdr_results_file = self.data_dir / "sdr_bdr_results.jsonl"
-        sdr_processed_slugs_file = self.data_dir / "sdr_processed_slugs.txt"
-        sdr_progress_file = self.data_dir / "sdr_progress.json"
-        sdr_final_csv_file = self.data_dir / f"sdr_bdr_final_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
-        # Load existing SDR processed slugs
-        sdr_processed_slugs = set()
-        if sdr_processed_slugs_file.exists():
-            with open(sdr_processed_slugs_file, 'r') as f:
-                sdr_processed_slugs = set(line.strip() for line in f if line.strip())
-            logger.info(f"Loaded {len(sdr_processed_slugs)} previously processed SDR company slugs")
-        
-        # Filter out already processed companies
-        unprocessed = []
-        for company in companies:
-            slug = company.get('slug', '')
-            if slug not in sdr_processed_slugs:
-                unprocessed.append(company)
-        
-        if not unprocessed:
-            logger.info("No unprocessed SDR companies found. All done!")
-            with job_lock:
-                jobs[job_id]['status'] = 'completed'
-                jobs[job_id]['message'] = 'All SDR companies already processed'
-            return
-        
-        logger.info(f"Starting individual SDR processing of {len(unprocessed)} companies...")
-        
-        with job_lock:
-            jobs[job_id]['status'] = 'processing'
-            jobs[job_id]['total_unprocessed'] = len(unprocessed)
-            jobs[job_id]['started_at'] = datetime.now().isoformat()
-        
-        start_time = time.time()
-        sdr_successful = 0
-        sdr_failed = 0
-        
-        for i, company in enumerate(unprocessed, 1):
-            slug = company.get('slug', 'unknown')
-            
-            try:
-                logger.info(f"[{job_id}] [{i}/{len(unprocessed)}] Processing SDR company {slug}...")
-                
-                # Process individual company for SDR count
-                result = self.process_single_company_sdr(company)
-                
-                # Save result immediately (persistent)
-                self._append_result_to_file(result, sdr_results_file)
-                self._append_slug_to_file(slug, sdr_processed_slugs_file)
-                sdr_processed_slugs.add(slug)
-                
-                # Update counters
-                if result.success:
-                    sdr_successful += 1
-                    logger.info(f"[{job_id}] ✅ SUCCESS: {slug} - {result.sales_bd_count} SDR/BDR ({result.processing_time_seconds:.2f}s)")
-                else:
-                    sdr_failed += 1
-                    logger.warning(f"[{job_id}] ❌ FAILED: {slug} - {result.error_message}")
-                
-                # Update job status
-                with job_lock:
-                    jobs[job_id]['processed_count'] = i
-                    jobs[job_id]['total_successful'] = sdr_successful
-                    jobs[job_id]['total_failed'] = sdr_failed
-                    jobs[job_id]['current_company'] = slug
-                
-                # Save progress every 10 companies
-                if i % 10 == 0:
-                    self._save_sdr_progress(sdr_successful, sdr_failed, i, sdr_progress_file)
-                    elapsed = time.time() - start_time
-                    rate = i / elapsed * 60  # companies per minute
-                    logger.info(f"[{job_id}] SDR Progress: {i}/{len(unprocessed)} ({i/len(unprocessed)*100:.1f}%) - Rate: {rate:.1f} companies/min")
-                
-                # Brief pause to be nice to the database
-                time.sleep(0.1)
-                
-            except Exception as e:
-                logger.error(f"[{job_id}] Unexpected error processing SDR {slug}: {e}")
-                sdr_failed += 1
-                continue
-        
-        # Generate final SDR CSV
-        self._generate_sdr_final_csv(sdr_results_file, sdr_final_csv_file)
-        
-        # Final save
-        self._save_sdr_progress(sdr_successful, sdr_failed, len(unprocessed), sdr_progress_file)
-        
-        elapsed = time.time() - start_time
-        with job_lock:
-            jobs[job_id]['status'] = 'completed'
-            jobs[job_id]['completed_at'] = datetime.now().isoformat()
-            jobs[job_id]['final_csv'] = sdr_final_csv_file.name
-            jobs[job_id]['processing_time_seconds'] = elapsed
-        
-        logger.info(f"[{job_id}] 🎉 Individual SDR processing complete!")
-        logger.info(f"[{job_id}] 📊 SDR Stats: {sdr_successful} successful, {sdr_failed} failed, {elapsed:.1f}s total")
-    
-    def _append_result_to_file(self, result: ProcessingResult, results_file):
-        """Append result to specified results file (atomic operation)"""
-        try:
-            # Atomic append using temporary file and rename
-            temp_file = results_file.with_suffix('.tmp')
-            
-            # If results file exists, copy it to temp first
-            if results_file.exists():
-                shutil.copy2(results_file, temp_file)
-            
-            # Append new result
-            with open(temp_file, 'a') as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                json.dump(result.to_dict(), f)
-                f.write('\n')
-                f.flush()
-                os.fsync(f.fileno())
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            
-            # Atomic replace
-            temp_file.replace(results_file)
-            
-        except Exception as e:
-            logger.error(f"Failed to append result for {result.company_slug}: {e}")
-    
-    def _append_slug_to_file(self, slug: str, slugs_file):
-        """Append company slug to specified processed list (atomic operation)"""
-        try:
-            with open(slugs_file, 'a') as f:
-                # Use file locking for thread safety
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                f.write(f"{slug}\n")
-                f.flush()
-                os.fsync(f.fileno())
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                
-        except Exception as e:
-            logger.error(f"Failed to append processed slug {slug}: {e}")
-    
-    def _save_sdr_progress(self, successful: int, failed: int, processed: int, progress_file):
-        """Save SDR progress to specified file"""
-        try:
-            progress = {
-                'total_processed': processed,
-                'total_successful': successful,
-                'total_failed': failed,
-                'last_updated': datetime.now().isoformat()
-            }
-            
-            # Atomic write
-            temp_file = progress_file.with_suffix('.tmp')
-            with open(temp_file, 'w') as f:
-                json.dump(progress, f, indent=2)
-            temp_file.replace(progress_file)
-            
-        except Exception as e:
-            logger.error(f"Failed to save SDR progress: {e}")
-    
-    def _generate_sdr_final_csv(self, results_file, final_csv_file):
-        """Generate final SDR CSV from JSONL results"""
-        try:
-            if not results_file.exists():
-                return
-            
-            results = []
-            with open(results_file, 'r') as f:
-                for line in f:
-                    if line.strip():
-                        result = json.loads(line.strip())
-                        if result.get('success', False):
-                            results.append({
-                                'slug': result['company_slug'],
-                                'hubspot_company_id': result.get('hubspot_company_id', ''),
-                                'sdr_bdr_count': result.get('sales_bd_count', 0)  # Reusing field name
-                            })
-            
-            if results:
-                with open(final_csv_file, 'w', newline='') as csvfile:
-                    fieldnames = ['slug', 'hubspot_company_id', 'sdr_bdr_count']
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(results)
-                
-                logger.info(f"Generated final SDR CSV with {len(results)} successful results: {final_csv_file.name}")
-            
-        except Exception as e:
-            logger.error(f"Failed to generate final SDR CSV: {e}")
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current processing statistics"""
+        return {
+            'total_processed': self.total_processed,
+            'total_successful': self.total_successful,
+            'total_failed': self.total_failed,
+            'processed_slugs_count': len(self.processed_slugs)
+        }
     
     def _generate_final_csv(self):
         """Generate final CSV from JSONL results with both metrics"""
@@ -875,190 +554,6 @@ def get_db_config():
     
     return config
 
-# Optimized Tag-First Sales/BD Query
-QUERY_TEMPLATE = """
--- Tag-first but optimized for performance
-WITH target_company AS (
-    SELECT lc.id as company_id, lcs.slug
-    FROM linkedin_company_slug lcs
-    INNER JOIN linkedin_company lc ON lc.id = lcs.linkedin_company_id
-    WHERE lcs.slug IN ({}) AND lc.slug_status = 'A'
-),
-sales_bd_positions AS (
-    SELECT DISTINCT
-        lpp3.linkedin_profile_id,
-        lpp3.title,
-        lp.first_name,
-        lp.last_name,
-        tc.slug
-    FROM target_company tc
-    INNER JOIN linkedin_profile_position3 lpp3 ON lpp3.linkedin_company_id = tc.company_id
-    INNER JOIN linkedin_profile lp ON lpp3.linkedin_profile_id = lp.id
-    -- OPTIMIZED: Use INNER JOINs instead of LEFT JOINs (faster, more accurate)
-    INNER JOIN company_position3 cp3 ON cp3.linkedin_profile_position3_id = lpp3.id
-    INNER JOIN job_title jt ON cp3.job_title_id = jt.id
-    WHERE lp.slug_status = 'A'
-      AND lpp3.is_current = true
-      AND lpp3.obsolete = false
-      AND (lpp3.end_date IS NULL OR lpp3.end_date > CURRENT_DATE)
-      -- TAG-FIRST: Use either tag 31 OR tag 45 (fixed from original AND logic)
-      AND (jt.tags && ARRAY[31] OR jt.tags && ARRAY[45])
-      -- EXCLUSIONS using ILIKE for GIN trigram optimization
-      AND NOT (
-          lpp3.title ILIKE '%investor%' OR lpp3.title ILIKE '%advisor%'
-          OR lpp3.title ILIKE '%board%' OR lpp3.title ILIKE '%founder%'
-          OR lpp3.title ILIKE '%vp%' OR lpp3.title ILIKE '%vice president%'
-          OR lpp3.title ILIKE '%cro%' OR lpp3.title ILIKE '%chief%'
-          OR lpp3.title ILIKE '%director%' OR lpp3.title ILIKE '%head of%'
-          OR lpp3.title ILIKE '%coordinator%' OR lpp3.title ILIKE '%assistant%'
-          OR lpp3.title ILIKE '%customer success%' OR lpp3.title ILIKE '%client success%'
-          OR lpp3.title ILIKE '%support%' OR lpp3.title ILIKE '%manager%'
-          OR lpp3.title ILIKE '%solutions%' OR lpp3.title ILIKE '%owner%'
-          OR lpp3.title ILIKE '%ceo%' OR lpp3.title ILIKE '%partner%'
-          OR lpp3.title ILIKE '%operations%' OR lpp3.title ILIKE '%enablement%'
-      )
-)
-SELECT 
-    slug,
-    COUNT(*) AS sales_bd_count
-FROM (
-    SELECT DISTINCT ON (LOWER(sbp.first_name), LOWER(sbp.last_name), sbp.slug)
-        sbp.slug,
-        sbp.linkedin_profile_id
-    FROM sales_bd_positions sbp
-    ORDER BY LOWER(sbp.first_name), LOWER(sbp.last_name), sbp.slug
-) AS deduplicated_people
-GROUP BY slug;
-"""
-
-# Optimized Smart SDR/BDR Query - Individual processing with expanded traditional list
-SDR_QUERY_TEMPLATE = """
--- Ultra-optimized Smart SDR Query - Only check prior roles when necessary
-WITH target_company AS (
-    SELECT lc.id as company_id, lcs.slug
-    FROM linkedin_company_slug lcs
-    INNER JOIN linkedin_company lc ON lc.id = lcs.linkedin_company_id
-    WHERE lcs.slug IN ({}) AND lc.slug_status = 'A'
-),
-current_positions AS (
-    SELECT DISTINCT
-        lpp3.linkedin_profile_id,
-        lpp3.title,
-        lp.first_name,
-        lp.last_name,
-        tc.slug,
-        CASE 
-            WHEN (
-                -- Traditional SDR titles - IMMEDIATE INCLUDE (EXPANDED LIST)
-                lpp3.title ILIKE 'sdr' OR lpp3.title ILIKE 'bdr'
-                OR lpp3.title ILIKE 'senior sdr' OR lpp3.title ILIKE 'senior bdr'
-                OR lpp3.title ILIKE 'associate sdr' OR lpp3.title ILIKE 'associate bdr'
-                OR lpp3.title ILIKE 'junior sdr' OR lpp3.title ILIKE 'junior bdr'
-                OR lpp3.title ILIKE '%sales development representative%'
-                OR lpp3.title ILIKE '%business development representative%'
-                -- EXPANDED ADDITIONS:
-                OR lpp3.title ILIKE '%business development%'
-                OR lpp3.title ILIKE '%sales development%'
-                OR lpp3.title ILIKE '%account development representative%'
-                OR lpp3.title ILIKE '%account development%'
-                OR lpp3.title ILIKE '%sales development associate%'
-                OR lpp3.title ILIKE '%inside sales representative%'
-            ) THEN 'include_immediately'
-            WHEN (
-                -- Creative titles - NEED TO CHECK PRIOR ROLE (CLEANED UP)
-                lpp3.title ILIKE '%growth specialist%' OR lpp3.title ILIKE '%growth representative%'
-                OR lpp3.title ILIKE '%account engagement specialist%'
-                OR lpp3.title ILIKE '%inbound success coach%'
-                OR lpp3.title ILIKE '%lead development%'
-            ) THEN 'check_prior_role'
-            ELSE 'exclude'
-        END as classification
-    FROM target_company tc
-    INNER JOIN linkedin_profile_position3 lpp3 ON lpp3.linkedin_company_id = tc.company_id
-    INNER JOIN linkedin_profile lp ON lpp3.linkedin_profile_id = lp.id
-    WHERE lp.slug_status = 'A'
-      AND lpp3.is_current = true
-      AND lpp3.obsolete = false
-      AND (lpp3.end_date IS NULL OR lpp3.end_date > CURRENT_DATE)
-      AND (
-          lpp3.title ILIKE '%sdr%' OR lpp3.title ILIKE '%bdr%'
-          OR lpp3.title ILIKE '%sales development%' OR lpp3.title ILIKE '%business development%'
-          OR lpp3.title ILIKE '%growth specialist%' OR lpp3.title ILIKE '%growth representative%'
-          OR lpp3.title ILIKE '%account engagement%' OR lpp3.title ILIKE '%lead development%'
-          OR lpp3.title ILIKE '%account development%' OR lpp3.title ILIKE '%inside sales representative%'
-      )
-      AND NOT (
-          lpp3.title ILIKE '%manager%' OR lpp3.title ILIKE '%director%'
-          OR lpp3.title ILIKE '%vp%' OR lpp3.title ILIKE '%vice president%'
-          OR lpp3.title ILIKE '%head of%' OR lpp3.title ILIKE '%chief%'
-          OR lpp3.title ILIKE '%founder%' OR lpp3.title ILIKE '%ceo%' OR lpp3.title ILIKE '%cro%'
-      )
-),
--- ONLY check prior roles for people who need it (massive performance gain)
-final_results AS (
-    SELECT 
-        linkedin_profile_id, first_name, last_name, slug,
-        'include' as decision
-    FROM current_positions 
-    WHERE classification = 'include_immediately'
-    
-    UNION ALL
-    
-    SELECT 
-        cp.linkedin_profile_id, cp.first_name, cp.last_name, cp.slug,
-        CASE 
-            WHEN EXISTS (
-                SELECT 1
-                FROM linkedin_profile_position3 lpp3_prior
-                WHERE lpp3_prior.linkedin_profile_id = cp.linkedin_profile_id
-                  AND lpp3_prior.linkedin_company_id != (
-                      SELECT lpp3_current.linkedin_company_id 
-                      FROM linkedin_profile_position3 lpp3_current 
-                      WHERE lpp3_current.linkedin_profile_id = cp.linkedin_profile_id 
-                        AND lpp3_current.is_current = true 
-                      LIMIT 1
-                  )
-                  AND lpp3_prior.obsolete = false
-                  AND lpp3_prior.end_date IS NOT NULL
-                  AND (
-                      lpp3_prior.title ILIKE 'sdr' OR lpp3_prior.title ILIKE 'bdr'
-                      OR lpp3_prior.title ILIKE 'senior sdr' OR lpp3_prior.title ILIKE 'senior bdr'
-                      OR lpp3_prior.title ILIKE 'associate sdr' OR lpp3_prior.title ILIKE 'associate bdr'
-                      OR lpp3_prior.title ILIKE 'junior sdr' OR lpp3_prior.title ILIKE 'junior bdr'
-                      OR lpp3_prior.title ILIKE '%sales development representative%'
-                      OR lpp3_prior.title ILIKE '%business development representative%'
-                      OR lpp3_prior.title ILIKE '%business development%'
-                      OR lpp3_prior.title ILIKE '%sales development%'
-                      OR lpp3_prior.title ILIKE '%account development representative%'
-                      OR lpp3_prior.title ILIKE '%account development%'
-                      OR lpp3_prior.title ILIKE '%sales development associate%'
-                      OR lpp3_prior.title ILIKE '%inside sales representative%'
-                  )
-                  AND NOT (
-                      lpp3_prior.title ILIKE '%manager%' OR lpp3_prior.title ILIKE '%director%'
-                      OR lpp3_prior.title ILIKE '%vp%' OR lpp3_prior.title ILIKE '%head of%'
-                  )
-                ORDER BY lpp3_prior.end_date DESC
-                LIMIT 1
-            ) THEN 'include'
-            ELSE 'exclude'
-        END as decision
-    FROM current_positions cp
-    WHERE classification = 'check_prior_role'
-)
-SELECT 
-    slug,
-    COUNT(*) AS sdr_bdr_count
-FROM (
-    SELECT DISTINCT ON (LOWER(fr.first_name), LOWER(fr.last_name), fr.slug)
-        fr.slug,
-        fr.linkedin_profile_id
-    FROM final_results fr
-    WHERE fr.decision = 'include'
-    ORDER BY LOWER(fr.first_name), LOWER(fr.last_name), fr.slug
-) AS deduplicated_sdrs
-GROUP BY slug;
-"""
 
 # Master Query Template - Gets both metrics in one shot for maximum efficiency
 MASTER_QUERY_TEMPLATE = """
@@ -1125,13 +620,46 @@ sdr_candidates AS (
                 OR lpp3.title ILIKE '%account development%'
                 OR lpp3.title ILIKE '%sales development associate%'
                 OR lpp3.title ILIKE '%inside sales representative%'
+                -- NEW RESEARCH-BASED ADDITIONS:
+                OR lpp3.title ILIKE '%lead gen%'
+                OR lpp3.title ILIKE '%growth development representative%'
+                OR lpp3.title ILIKE '%revenue development representative%'
+                OR lpp3.title ILIKE '%lead conversion%'
+                OR lpp3.title ILIKE '%inbound growth representative%'
+                OR lpp3.title ILIKE '%outbound growth representative%'
+                OR lpp3.title ILIKE '%growth outreach representative%'
+                OR lpp3.title ILIKE '%prospect development representative%'
+                OR lpp3.title ILIKE '%target account development representative%'
+                OR lpp3.title ILIKE '%pipeline development%'
+                OR lpp3.title ILIKE '%new business growth%'
+                OR lpp3.title ILIKE '%lead qualification%'
+                OR lpp3.title ILIKE '%sales growth representative%'
+                OR lpp3.title ILIKE '%lead generation representative%'
+                OR lpp3.title ILIKE '%business development scout%'
+                OR lpp3.title ILIKE '%lead development representative%'
             ) THEN 'include_immediately'
             WHEN (
-                -- Creative titles - CHECK PRIOR ROLE
+                -- Creative titles - CHECK PRIOR ROLE (research-based patterns)
                 lpp3.title ILIKE '%growth specialist%' OR lpp3.title ILIKE '%growth representative%'
-                OR lpp3.title ILIKE '%account engagement specialist%'
-                OR lpp3.title ILIKE '%inbound success coach%'
-                OR lpp3.title ILIKE '%lead development%'
+                OR lpp3.title ILIKE '%growth consultant%'
+                OR lpp3.title ILIKE '%business development specialist%'
+                OR lpp3.title ILIKE '%sales development specialist%'
+                OR lpp3.title ILIKE '%inside sales specialist%'
+                OR lpp3.title ILIKE '%account development specialist%'
+                OR lpp3.title ILIKE '%lead development engineer%'
+                -- NEW RESEARCH-BASED CREATIVE TITLES:
+                OR lpp3.title ILIKE '%pipeline strategist%'
+                OR lpp3.title ILIKE '%demand acquisition%'
+                OR lpp3.title ILIKE '%prospect engagement%'
+                OR lpp3.title ILIKE '%business growth representative%'
+                OR lpp3.title ILIKE '%engagement development representative%'
+                OR lpp3.title ILIKE '%market development representative%'
+                OR lpp3.title ILIKE '%opportunity development representative%'
+                OR lpp3.title ILIKE '%revenue growth representative%'
+                OR lpp3.title ILIKE '%business development accelerator%'
+                OR lpp3.title ILIKE '%business growth associate%'
+                OR lpp3.title ILIKE '%demand generation representative%'
+                OR lpp3.title ILIKE '%pipeline growth%'
             ) THEN 'check_prior_role'
             ELSE 'exclude'
         END as sdr_classification
@@ -1146,8 +674,14 @@ sdr_candidates AS (
           lpp3.title ILIKE '%sdr%' OR lpp3.title ILIKE '%bdr%'
           OR lpp3.title ILIKE '%sales development%' OR lpp3.title ILIKE '%business development%'
           OR lpp3.title ILIKE '%growth specialist%' OR lpp3.title ILIKE '%growth representative%'
-          OR lpp3.title ILIKE '%account engagement%' OR lpp3.title ILIKE '%lead development%'
+          OR lpp3.title ILIKE '%growth consultant%' OR lpp3.title ILIKE '%lead development%'
           OR lpp3.title ILIKE '%account development%' OR lpp3.title ILIKE '%inside sales representative%'
+          OR lpp3.title ILIKE '%inside sales specialist%' OR lpp3.title ILIKE '%sales development specialist%'
+          OR lpp3.title ILIKE '%lead gen%' OR lpp3.title ILIKE '%revenue development%'
+          OR lpp3.title ILIKE '%lead conversion%' OR lpp3.title ILIKE '%pipeline development%'
+          OR lpp3.title ILIKE '%lead qualification%' OR lpp3.title ILIKE '%lead generation%'
+          OR lpp3.title ILIKE '%pipeline strategist%' OR lpp3.title ILIKE '%demand acquisition%'
+          OR lpp3.title ILIKE '%prospect engagement%' OR lpp3.title ILIKE '%pipeline growth%'
       )
       AND NOT (
           lpp3.title ILIKE '%manager%' OR lpp3.title ILIKE '%director%'
@@ -1195,6 +729,23 @@ final_sdrs AS (
                 OR lpp3_prior.title ILIKE '%account development%'
                 OR lpp3_prior.title ILIKE '%sales development associate%'
                 OR lpp3_prior.title ILIKE '%inside sales representative%'
+                -- NEW RESEARCH-BASED ADDITIONS (matching traditional list 1:1):
+                OR lpp3_prior.title ILIKE '%lead gen%'
+                OR lpp3_prior.title ILIKE '%growth development representative%'
+                OR lpp3_prior.title ILIKE '%revenue development representative%'
+                OR lpp3_prior.title ILIKE '%lead conversion%'
+                OR lpp3_prior.title ILIKE '%inbound growth representative%'
+                OR lpp3_prior.title ILIKE '%outbound growth representative%'
+                OR lpp3_prior.title ILIKE '%growth outreach representative%'
+                OR lpp3_prior.title ILIKE '%prospect development representative%'
+                OR lpp3_prior.title ILIKE '%target account development representative%'
+                OR lpp3_prior.title ILIKE '%pipeline development%'
+                OR lpp3_prior.title ILIKE '%new business growth%'
+                OR lpp3_prior.title ILIKE '%lead qualification%'
+                OR lpp3_prior.title ILIKE '%sales growth representative%'
+                OR lpp3_prior.title ILIKE '%lead generation representative%'
+                OR lpp3_prior.title ILIKE '%business development scout%'
+                OR lpp3_prior.title ILIKE '%lead development representative%'
             )
             AND NOT (
                 lpp3_prior.title ILIKE '%manager%' OR lpp3_prior.title ILIKE '%director%'
@@ -1266,61 +817,6 @@ def process_companies_individual(job_id, companies, input_format, batch_size=1):
         
         # Use batch_size parameter (passed from API endpoint)
         # Process all companies with configurable batch size
-        processor.process_all_with_batch(formatted_companies, job_id, batch_size)
-        
-    except Exception as e:
-        error_msg = str(e)
-        traceback_msg = traceback.format_exc()
-        
-        with job_lock:
-            jobs[job_id]['status'] = 'failed'
-            jobs[job_id]['error'] = error_msg
-            jobs[job_id]['traceback'] = traceback_msg
-            jobs[job_id]['failed_at'] = datetime.now().isoformat()
-        
-        print(f"[JOB {job_id}] FAILED: {error_msg}", flush=True)
-        print(f"[JOB {job_id}] TRACEBACK: {traceback_msg}", flush=True)
-        sys.stdout.flush()
-
-def process_companies_individual_sdr(job_id, companies, input_format, batch_size=1):
-    """Individual SDR processing function with smart resume and deduplication"""
-    try:
-        print(f"[JOB {job_id}] START: Individual SDR processing of {len(companies)} companies", flush=True)
-        sys.stdout.flush()
-        
-        # Test database connection first
-        print(f"[JOB {job_id}] Testing database connection...", flush=True)
-        sys.stdout.flush()
-        
-        db_config = get_db_config()
-        conn = psycopg2.connect(**db_config)
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        result = cursor.fetchone()
-        conn.close()
-        
-        print(f"[JOB {job_id}] Database connection successful", flush=True)
-        sys.stdout.flush()
-        
-        # Set database config for processor
-        processor.db_config = db_config
-        
-        # Convert companies to proper format
-        formatted_companies = []
-        for company in companies:
-            if input_format == 'csv':
-                formatted_companies.append({
-                    'slug': company['slug'],
-                    'hubspot_company_id': company['hubspot_company_id']
-                })
-            else:
-                formatted_companies.append({
-                    'slug': company,
-                    'hubspot_company_id': ''
-                })
-        
-        # Use batch_size parameter (passed from API endpoint)
-        # Process all companies for SDR count with configurable batch size
         processor.process_all_with_batch(formatted_companies, job_id, batch_size)
         
     except Exception as e:
