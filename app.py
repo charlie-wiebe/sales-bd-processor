@@ -241,6 +241,68 @@ class SmartSalesBDProcessor:
                 error_message=str(e)
             )
     
+    def process_single_company_sdr(self, company: Dict[str, Any]) -> ProcessingResult:
+        """Process a single company with SDR/BDR database query"""
+        slug = company.get('slug', 'unknown')
+        hubspot_id = company.get('hubspot_company_id', '')
+        
+        start_time = time.time()
+        
+        try:
+            logger.debug(f"Processing company {slug} for SDR count")
+            
+            # Execute the SDR query for this single company
+            conn = psycopg2.connect(**self.db_config)
+            cursor = conn.cursor()
+            
+            # Set query timeout
+            cursor.execute("SET statement_timeout = '30s'")
+            
+            # Use the SDR query template for single company
+            query = SDR_QUERY_TEMPLATE.format(f"'{slug}'")
+            cursor.execute(query)
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            processing_time = time.time() - start_time
+            
+            if result:
+                sdr_bdr_count = result[1]  # Second column is the count
+                return ProcessingResult(
+                    company_slug=slug,
+                    company_name=slug,  # Using slug as name for now
+                    hubspot_company_id=hubspot_id,
+                    processed_at=datetime.now().isoformat(),
+                    processing_time_seconds=processing_time,
+                    success=True,
+                    sales_bd_count=sdr_bdr_count  # Reusing same field for SDR count
+                )
+            else:
+                return ProcessingResult(
+                    company_slug=slug,
+                    company_name=slug,
+                    hubspot_company_id=hubspot_id,
+                    processed_at=datetime.now().isoformat(),
+                    processing_time_seconds=processing_time,
+                    success=True,
+                    sales_bd_count=0
+                )
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            logger.error(f"Failed to process company {slug} for SDR count: {e}")
+            
+            return ProcessingResult(
+                company_slug=slug,
+                company_name=slug,
+                hubspot_company_id=hubspot_id,
+                processed_at=datetime.now().isoformat(),
+                processing_time_seconds=processing_time,
+                success=False,
+                error_message=str(e)
+            )
+    
     def process_all_individual(self, companies: list, job_id: str):
         """Process all companies individually with smart resume"""
         
@@ -322,6 +384,195 @@ class SmartSalesBDProcessor:
         
         logger.info(f"[{job_id}] 🎉 Individual processing complete!")
         logger.info(f"[{job_id}] 📊 Stats: {self.total_successful} successful, {self.total_failed} failed, {elapsed:.1f}s total")
+    
+    def process_all_individual_sdr(self, companies: list, job_id: str):
+        """Process all companies individually for SDR/BDR count with smart resume"""
+        
+        # Setup SDR-specific file paths
+        sdr_results_file = self.data_dir / "sdr_bdr_results.jsonl"
+        sdr_processed_slugs_file = self.data_dir / "sdr_processed_slugs.txt"
+        sdr_progress_file = self.data_dir / "sdr_progress.json"
+        sdr_final_csv_file = self.data_dir / f"sdr_bdr_final_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        # Load existing SDR processed slugs
+        sdr_processed_slugs = set()
+        if sdr_processed_slugs_file.exists():
+            with open(sdr_processed_slugs_file, 'r') as f:
+                sdr_processed_slugs = set(line.strip() for line in f if line.strip())
+            logger.info(f"Loaded {len(sdr_processed_slugs)} previously processed SDR company slugs")
+        
+        # Filter out already processed companies
+        unprocessed = []
+        for company in companies:
+            slug = company.get('slug', '')
+            if slug not in sdr_processed_slugs:
+                unprocessed.append(company)
+        
+        if not unprocessed:
+            logger.info("No unprocessed SDR companies found. All done!")
+            with job_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['message'] = 'All SDR companies already processed'
+            return
+        
+        logger.info(f"Starting individual SDR processing of {len(unprocessed)} companies...")
+        
+        with job_lock:
+            jobs[job_id]['status'] = 'processing'
+            jobs[job_id]['total_unprocessed'] = len(unprocessed)
+            jobs[job_id]['started_at'] = datetime.now().isoformat()
+        
+        start_time = time.time()
+        sdr_successful = 0
+        sdr_failed = 0
+        
+        for i, company in enumerate(unprocessed, 1):
+            slug = company.get('slug', 'unknown')
+            
+            try:
+                logger.info(f"[{job_id}] [{i}/{len(unprocessed)}] Processing SDR company {slug}...")
+                
+                # Process individual company for SDR count
+                result = self.process_single_company_sdr(company)
+                
+                # Save result immediately (persistent)
+                self._append_result_to_file(result, sdr_results_file)
+                self._append_slug_to_file(slug, sdr_processed_slugs_file)
+                sdr_processed_slugs.add(slug)
+                
+                # Update counters
+                if result.success:
+                    sdr_successful += 1
+                    logger.info(f"[{job_id}] ✅ SUCCESS: {slug} - {result.sales_bd_count} SDR/BDR ({result.processing_time_seconds:.2f}s)")
+                else:
+                    sdr_failed += 1
+                    logger.warning(f"[{job_id}] ❌ FAILED: {slug} - {result.error_message}")
+                
+                # Update job status
+                with job_lock:
+                    jobs[job_id]['processed_count'] = i
+                    jobs[job_id]['total_successful'] = sdr_successful
+                    jobs[job_id]['total_failed'] = sdr_failed
+                    jobs[job_id]['current_company'] = slug
+                
+                # Save progress every 10 companies
+                if i % 10 == 0:
+                    self._save_sdr_progress(sdr_successful, sdr_failed, i, sdr_progress_file)
+                    elapsed = time.time() - start_time
+                    rate = i / elapsed * 60  # companies per minute
+                    logger.info(f"[{job_id}] SDR Progress: {i}/{len(unprocessed)} ({i/len(unprocessed)*100:.1f}%) - Rate: {rate:.1f} companies/min")
+                
+                # Brief pause to be nice to the database
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"[{job_id}] Unexpected error processing SDR {slug}: {e}")
+                sdr_failed += 1
+                continue
+        
+        # Generate final SDR CSV
+        self._generate_sdr_final_csv(sdr_results_file, sdr_final_csv_file)
+        
+        # Final save
+        self._save_sdr_progress(sdr_successful, sdr_failed, len(unprocessed), sdr_progress_file)
+        
+        elapsed = time.time() - start_time
+        with job_lock:
+            jobs[job_id]['status'] = 'completed'
+            jobs[job_id]['completed_at'] = datetime.now().isoformat()
+            jobs[job_id]['final_csv'] = sdr_final_csv_file.name
+            jobs[job_id]['processing_time_seconds'] = elapsed
+        
+        logger.info(f"[{job_id}] 🎉 Individual SDR processing complete!")
+        logger.info(f"[{job_id}] 📊 SDR Stats: {sdr_successful} successful, {sdr_failed} failed, {elapsed:.1f}s total")
+    
+    def _append_result_to_file(self, result: ProcessingResult, results_file):
+        """Append result to specified results file (atomic operation)"""
+        try:
+            # Atomic append using temporary file and rename
+            temp_file = results_file.with_suffix('.tmp')
+            
+            # If results file exists, copy it to temp first
+            if results_file.exists():
+                shutil.copy2(results_file, temp_file)
+            
+            # Append new result
+            with open(temp_file, 'a') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                json.dump(result.to_dict(), f)
+                f.write('\n')
+                f.flush()
+                os.fsync(f.fileno())
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            
+            # Atomic replace
+            temp_file.replace(results_file)
+            
+        except Exception as e:
+            logger.error(f"Failed to append result for {result.company_slug}: {e}")
+    
+    def _append_slug_to_file(self, slug: str, slugs_file):
+        """Append company slug to specified processed list (atomic operation)"""
+        try:
+            with open(slugs_file, 'a') as f:
+                # Use file locking for thread safety
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.write(f"{slug}\n")
+                f.flush()
+                os.fsync(f.fileno())
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                
+        except Exception as e:
+            logger.error(f"Failed to append processed slug {slug}: {e}")
+    
+    def _save_sdr_progress(self, successful: int, failed: int, processed: int, progress_file):
+        """Save SDR progress to specified file"""
+        try:
+            progress = {
+                'total_processed': processed,
+                'total_successful': successful,
+                'total_failed': failed,
+                'last_updated': datetime.now().isoformat()
+            }
+            
+            # Atomic write
+            temp_file = progress_file.with_suffix('.tmp')
+            with open(temp_file, 'w') as f:
+                json.dump(progress, f, indent=2)
+            temp_file.replace(progress_file)
+            
+        except Exception as e:
+            logger.error(f"Failed to save SDR progress: {e}")
+    
+    def _generate_sdr_final_csv(self, results_file, final_csv_file):
+        """Generate final SDR CSV from JSONL results"""
+        try:
+            if not results_file.exists():
+                return
+            
+            results = []
+            with open(results_file, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        result = json.loads(line.strip())
+                        if result.get('success', False):
+                            results.append({
+                                'slug': result['company_slug'],
+                                'hubspot_company_id': result.get('hubspot_company_id', ''),
+                                'sdr_bdr_count': result.get('sales_bd_count', 0)  # Reusing field name
+                            })
+            
+            if results:
+                with open(final_csv_file, 'w', newline='') as csvfile:
+                    fieldnames = ['slug', 'hubspot_company_id', 'sdr_bdr_count']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(results)
+                
+                logger.info(f"Generated final SDR CSV with {len(results)} successful results: {final_csv_file.name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate final SDR CSV: {e}")
     
     def _generate_final_csv(self):
         """Generate final CSV from JSONL results"""
@@ -453,6 +704,113 @@ FROM (
 GROUP BY slug;
 """
 
+# SDR/BDR Query Template - Comprehensive title-based filtering
+SDR_QUERY_TEMPLATE = """
+SELECT 
+    slug,
+    COUNT(*) AS sdr_bdr_count
+FROM (
+    SELECT DISTINCT ON (LOWER(lp.first_name), LOWER(lp.last_name), lcs.slug)
+        lcs.slug,
+        lp.id AS profile_id
+    FROM linkedin_profile_position3 lpp3
+    INNER JOIN linkedin_company lc ON lpp3.linkedin_company_id = lc.id
+    INNER JOIN linkedin_company_slug lcs ON lc.id = lcs.linkedin_company_id
+    INNER JOIN linkedin_profile lp ON lpp3.linkedin_profile_id = lp.id
+    WHERE lcs.slug IN ({})
+      AND lc.slug_status = 'A'
+      AND lp.slug_status = 'A'
+      AND lpp3.is_current = true
+      AND lpp3.obsolete = false
+      AND (lpp3.end_date IS NULL OR lpp3.end_date > CURRENT_DATE)
+      AND (
+        -- Tier 1: Exact standard titles
+        LOWER(lpp3.title) IN (
+          'sdr', 'bdr', 
+          'sales development representative', 
+          'business development representative',
+          'inside sales representative',
+          'sales development associate',
+          'business development associate'
+        )
+        
+        -- Tier 2: Core pattern matches
+        OR LOWER(lpp3.title) LIKE '%sales development representative%'
+        OR LOWER(lpp3.title) LIKE '%business development representative%'
+        OR LOWER(lpp3.title) LIKE '%inside sales representative%'
+        OR LOWER(lpp3.title) LIKE '%inside sales rep%'
+        OR LOWER(lpp3.title) LIKE '%sales development associate%'
+        OR LOWER(lpp3.title) LIKE '%business development associate%'
+        
+        -- Tier 3: Abbreviations and variations
+        OR LOWER(lpp3.title) LIKE 'sdr %'
+        OR LOWER(lpp3.title) LIKE '% sdr'
+        OR LOWER(lpp3.title) LIKE 'bdr %'
+        OR LOWER(lpp3.title) LIKE '% bdr'
+        
+        -- Tier 4: Specialist/Executive variations
+        OR LOWER(lpp3.title) LIKE '%sales development specialist%'
+        OR LOWER(lpp3.title) LIKE '%business development specialist%'
+        OR LOWER(lpp3.title) LIKE '%sales development executive%'
+        OR LOWER(lpp3.title) LIKE '%business development executive%'
+        OR LOWER(lpp3.title) LIKE '%inside sales specialist%'
+        OR LOWER(lpp3.title) LIKE '%inside sales associate%'
+        
+        -- Tier 5: Company-specific patterns (Box, Dell, etc.)
+        OR LOWER(lpp3.title) LIKE '%outbound business representative%'
+        OR LOWER(lpp3.title) LIKE '%inside sales account executive%'
+        OR LOWER(lpp3.title) LIKE '%account development%'
+        OR LOWER(lpp3.title) LIKE '%lead development%'
+        
+        -- Tier 6: Creative/Modern titles (HubSpot style)
+        OR LOWER(lpp3.title) LIKE '%growth specialist%'
+        OR LOWER(lpp3.title) LIKE '%inbound success coach%'
+        OR LOWER(lpp3.title) = 'growth representative'
+        OR LOWER(lpp3.title) LIKE '%account engagement specialist%'
+        
+        -- Tier 7: Seniority variations (still IC roles)
+        OR LOWER(lpp3.title) LIKE 'senior sdr%'
+        OR LOWER(lpp3.title) LIKE 'senior bdr%'
+        OR LOWER(lpp3.title) LIKE 'associate sdr%'
+        OR LOWER(lpp3.title) LIKE 'associate bdr%'
+        OR LOWER(lpp3.title) LIKE '%sdr ii%'
+        OR LOWER(lpp3.title) LIKE '%bdr ii%'
+        OR LOWER(lpp3.title) LIKE '%sales development representative ii%'
+      )
+      AND NOT (
+        -- Exclude management/leadership
+        LOWER(lpp3.title) LIKE '%manager%'
+        OR LOWER(lpp3.title) LIKE '%director%'
+        OR LOWER(lpp3.title) LIKE '%vp%'
+        OR LOWER(lpp3.title) LIKE '%vice president%'
+        OR LOWER(lpp3.title) LIKE '%head of%'
+        OR LOWER(lpp3.title) LIKE '%chief%'
+        OR LOWER(lpp3.title) LIKE '% lead%'
+        OR LOWER(lpp3.title) LIKE 'lead %'
+        
+        -- Exclude non-prospecting sales roles
+        OR LOWER(lpp3.title) LIKE '%account manager%'
+        OR LOWER(lpp3.title) LIKE '%customer success%'
+        OR LOWER(lpp3.title) LIKE '%customer support%'
+        OR LOWER(lpp3.title) LIKE '%renewal%'
+        OR LOWER(lpp3.title) LIKE '%partnership%'
+        OR LOWER(lpp3.title) = 'ae'
+        
+        -- Exclude technical roles that might have similar keywords
+        OR LOWER(lpp3.title) LIKE '%engineer%'
+        OR LOWER(lpp3.title) LIKE '%analyst%'
+        
+        -- Exclude senior leadership titles that might slip through
+        OR LOWER(lpp3.title) LIKE '%founder%'
+        OR LOWER(lpp3.title) LIKE '%ceo%'
+        OR LOWER(lpp3.title) LIKE '%cro%'
+        OR LOWER(lpp3.title) LIKE '%owner%'
+      )
+    ORDER BY LOWER(lp.first_name), LOWER(lp.last_name), lcs.slug, lp.updated_at DESC NULLS LAST
+) AS deduplicated_sdrs
+GROUP BY slug;
+"""
+
 def process_companies_individual(job_id, companies, input_format):
     """Individual processing function with smart resume and deduplication"""
     try:
@@ -507,6 +865,60 @@ def process_companies_individual(job_id, companies, input_format):
         print(f"[JOB {job_id}] TRACEBACK: {traceback_msg}", flush=True)
         sys.stdout.flush()
 
+def process_companies_individual_sdr(job_id, companies, input_format):
+    """Individual SDR processing function with smart resume and deduplication"""
+    try:
+        print(f"[JOB {job_id}] START: Individual SDR processing of {len(companies)} companies", flush=True)
+        sys.stdout.flush()
+        
+        # Test database connection first
+        print(f"[JOB {job_id}] Testing database connection...", flush=True)
+        sys.stdout.flush()
+        
+        db_config = get_db_config()
+        conn = psycopg2.connect(**db_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        result = cursor.fetchone()
+        conn.close()
+        
+        print(f"[JOB {job_id}] Database connection successful", flush=True)
+        sys.stdout.flush()
+        
+        # Set database config for processor
+        processor.db_config = db_config
+        
+        # Convert companies to proper format
+        formatted_companies = []
+        for company in companies:
+            if input_format == 'csv':
+                formatted_companies.append({
+                    'slug': company['slug'],
+                    'hubspot_company_id': company['hubspot_company_id']
+                })
+            else:
+                formatted_companies.append({
+                    'slug': company,
+                    'hubspot_company_id': ''
+                })
+        
+        # Process all companies individually for SDR count
+        processor.process_all_individual_sdr(formatted_companies, job_id)
+        
+    except Exception as e:
+        error_msg = str(e)
+        traceback_msg = traceback.format_exc()
+        
+        with job_lock:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['error'] = error_msg
+            jobs[job_id]['traceback'] = traceback_msg
+            jobs[job_id]['failed_at'] = datetime.now().isoformat()
+        
+        print(f"[JOB {job_id}] FAILED: {error_msg}", flush=True)
+        print(f"[JOB {job_id}] TRACEBACK: {traceback_msg}", flush=True)
+        sys.stdout.flush()
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -538,6 +950,18 @@ HTML_TEMPLATE = """
     <div class="section">
         <h3>Start New Job</h3>
         <form id="jobForm">
+            <div class="form-group">
+                <label>Job Type:</label>
+                <div>
+                    <input type="radio" id="salesBdJob" name="jobType" value="sales_bd" checked>
+                    <label for="salesBdJob">Sales/BD Count (uses job function tags)</label>
+                </div>
+                <div>
+                    <input type="radio" id="sdrJob" name="jobType" value="sdr">
+                    <label for="sdrJob">SDR/BDR Count (title-based matching)</label>
+                </div>
+            </div>
+            
             <div class="form-group">
                 <label>Input Format:</label>
                 <div>
@@ -697,6 +1121,7 @@ HTML_TEMPLATE = """
             e.preventDefault();
             
             const inputFormat = document.querySelector('input[name="inputFormat"]:checked').value;
+            const jobType = document.querySelector('input[name="jobType"]:checked').value;
             const inputData = document.getElementById('companies').value.trim();
             const batchSize = parseInt(document.getElementById('batchSize').value);
             
@@ -722,10 +1147,16 @@ HTML_TEMPLATE = """
             }
             
             try {
-                const response = await fetch('/start-job', {
+                // Choose endpoint based on job type
+                const endpoint = jobType === 'sdr' ? '/start-sdr-job' : '/start-job';
+                const requestBody = jobType === 'sdr' 
+                    ? { companies, input_format: inputFormat }
+                    : { companies, batch_size: batchSize, input_format: inputFormat };
+                
+                const response = await fetch(endpoint, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ companies, batch_size: batchSize, input_format: inputFormat })
+                    body: JSON.stringify(requestBody)
                 });
                 
                 const result = await response.json();
@@ -865,6 +1296,57 @@ def start_job():
         
     except Exception as e:
         print(f"[API] Error starting job: {e}", flush=True)
+        sys.stdout.flush()
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/start-sdr-job', methods=['POST'])
+def start_sdr_job():
+    """Start an individual SDR processing job with smart resume"""
+    try:
+        data = request.json
+        companies = data['companies']
+        input_format = data.get('input_format', 'slugs')
+        
+        # Generate unique job ID
+        job_id = str(uuid.uuid4())
+        
+        print(f"[API] Starting SDR job {job_id} for {len(companies)} companies", flush=True)
+        sys.stdout.flush()
+        
+        # Get processor stats
+        stats = processor.get_stats()
+        
+        # Store job info
+        with job_lock:
+            jobs[job_id] = {
+                'id': job_id,
+                'type': 'sdr',  # Mark as SDR job
+                'status': 'queued',
+                'created_at': datetime.now().isoformat(),
+                'total_companies': len(companies),
+                'input_format': input_format,
+                'processing_mode': 'individual_sdr'
+            }
+        
+        # Start background thread for SDR processing
+        thread = threading.Thread(
+            target=process_companies_individual_sdr,
+            args=(job_id, companies, input_format)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'message': f'Individual SDR processing job started for {len(companies)} companies',
+            'processing_mode': 'individual_sdr',
+            'smart_resume': True,
+            'job_type': 'sdr'
+        })
+        
+    except Exception as e:
+        print(f"[API] Error starting SDR job: {e}", flush=True)
         sys.stdout.flush()
         return jsonify({'success': False, 'error': str(e)})
 
