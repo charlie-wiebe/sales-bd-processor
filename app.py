@@ -1,8 +1,14 @@
+#!/usr/bin/env python3
+"""
+Smart Sales BD Processor - Individual Processing with Persistent Deduplication
+Processes companies one at a time with fault tolerance and resume capability
+"""
+
 import os
 import psycopg2
 import time
 from flask import Flask, request, jsonify, render_template_string
-from typing import List
+from typing import List, Dict, Any, Optional
 import io
 import tempfile
 import base64
@@ -13,12 +19,355 @@ import threading
 import json
 import uuid
 import traceback
+import hashlib
+import logging
+from pathlib import Path
+import fcntl
+import shutil
+from dataclasses import dataclass, asdict
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 # Global job storage
 jobs = {}
 job_lock = threading.Lock()
+
+@dataclass
+class ProcessingResult:
+    """Structure for individual company processing results"""
+    company_slug: str
+    company_name: str
+    hubspot_company_id: str
+    processed_at: str
+    processing_time_seconds: float
+    success: bool
+    sales_bd_count: int = 0
+    error_message: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+    
+    def get_hash(self) -> str:
+        """Generate hash for deduplication based on company_slug"""
+        return hashlib.md5(self.company_slug.encode()).hexdigest()
+
+class SmartSalesBDProcessor:
+    """Smart individual processor with persistent deduplication"""
+    
+    def __init__(self, data_dir: str = "/data"):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(exist_ok=True)
+        
+        # File paths
+        self.results_file = self.data_dir / "sales_bd_results.jsonl"
+        self.processed_slugs_file = self.data_dir / "processed_slugs.txt"
+        self.progress_file = self.data_dir / "progress.json"
+        self.final_csv_file = self.data_dir / f"sales_bd_final_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        # In-memory cache for fast lookups
+        self.processed_slugs = set()
+        self.total_processed = 0
+        self.total_successful = 0
+        self.total_failed = 0
+        
+        # Database config
+        self.db_config = None
+        
+        # Load existing state
+        self._load_state()
+        
+    def _load_state(self):
+        """Load existing processed slugs and progress from disk"""
+        try:
+            # Load processed slugs
+            if self.processed_slugs_file.exists():
+                with open(self.processed_slugs_file, 'r') as f:
+                    self.processed_slugs = set(line.strip() for line in f if line.strip())
+                logger.info(f"Loaded {len(self.processed_slugs)} previously processed company slugs")
+            
+            # Load progress stats
+            if self.progress_file.exists():
+                with open(self.progress_file, 'r') as f:
+                    progress = json.load(f)
+                    self.total_processed = progress.get('total_processed', 0)
+                    self.total_successful = progress.get('total_successful', 0)
+                    self.total_failed = progress.get('total_failed', 0)
+                logger.info(f"Loaded progress: {self.total_processed} processed, {self.total_successful} successful, {self.total_failed} failed")
+                
+        except Exception as e:
+            logger.warning(f"Could not load previous state: {e}")
+    
+    def _save_progress(self):
+        """Save current progress to disk"""
+        try:
+            progress = {
+                'total_processed': self.total_processed,
+                'total_successful': self.total_successful,
+                'total_failed': self.total_failed,
+                'last_updated': datetime.now().isoformat()
+            }
+            
+            # Atomic write
+            temp_file = self.progress_file.with_suffix('.tmp')
+            with open(temp_file, 'w') as f:
+                json.dump(progress, f, indent=2)
+            temp_file.replace(self.progress_file)
+            
+        except Exception as e:
+            logger.error(f"Failed to save progress: {e}")
+    
+    def _append_processed_slug(self, slug: str):
+        """Append company slug to processed list (atomic operation)"""
+        try:
+            with open(self.processed_slugs_file, 'a') as f:
+                # Use file locking for thread safety
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.write(f"{slug}\n")
+                f.flush()
+                os.fsync(f.fileno())
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                
+            self.processed_slugs.add(slug)
+            
+        except Exception as e:
+            logger.error(f"Failed to append processed slug {slug}: {e}")
+    
+    def _append_result(self, result: ProcessingResult):
+        """Append result to results file (atomic operation)"""
+        try:
+            # Atomic append using temporary file and rename
+            temp_file = self.results_file.with_suffix('.tmp')
+            
+            # If results file exists, copy it to temp first
+            if self.results_file.exists():
+                shutil.copy2(self.results_file, temp_file)
+            
+            # Append new result
+            with open(temp_file, 'a') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                json.dump(result.to_dict(), f)
+                f.write('\n')
+                f.flush()
+                os.fsync(f.fileno())
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            
+            # Atomic replace
+            temp_file.replace(self.results_file)
+            
+        except Exception as e:
+            logger.error(f"Failed to append result for {result.company_slug}: {e}")
+    
+    def is_already_processed(self, slug: str) -> bool:
+        """Check if company has already been processed"""
+        return slug in self.processed_slugs
+    
+    def get_unprocessed_companies(self, all_companies: list) -> list:
+        """Filter out already processed companies"""
+        unprocessed = []
+        for company in all_companies:
+            slug = company.get('slug', '')
+            if not self.is_already_processed(slug):
+                unprocessed.append(company)
+        
+        logger.info(f"Found {len(unprocessed)} unprocessed companies out of {len(all_companies)} total")
+        return unprocessed
+    
+    def process_single_company(self, company: Dict[str, Any]) -> ProcessingResult:
+        """Process a single company with database query"""
+        slug = company.get('slug', 'unknown')
+        hubspot_id = company.get('hubspot_company_id', '')
+        
+        start_time = time.time()
+        
+        try:
+            logger.debug(f"Processing company {slug}")
+            
+            # Execute the sales BD query for this single company
+            conn = psycopg2.connect(**self.db_config)
+            cursor = conn.cursor()
+            
+            # Set query timeout
+            cursor.execute("SET statement_timeout = '30s'")
+            
+            # Use the existing query template for single company
+            query = QUERY_TEMPLATE.format(f"'{slug}'")
+            cursor.execute(query)
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            processing_time = time.time() - start_time
+            
+            if result:
+                sales_bd_count = result[1]  # Second column is the count
+                return ProcessingResult(
+                    company_slug=slug,
+                    company_name=slug,  # Using slug as name for now
+                    hubspot_company_id=hubspot_id,
+                    processed_at=datetime.now().isoformat(),
+                    processing_time_seconds=processing_time,
+                    success=True,
+                    sales_bd_count=sales_bd_count
+                )
+            else:
+                return ProcessingResult(
+                    company_slug=slug,
+                    company_name=slug,
+                    hubspot_company_id=hubspot_id,
+                    processed_at=datetime.now().isoformat(),
+                    processing_time_seconds=processing_time,
+                    success=True,
+                    sales_bd_count=0
+                )
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            logger.error(f"Failed to process company {slug}: {e}")
+            
+            return ProcessingResult(
+                company_slug=slug,
+                company_name=slug,
+                hubspot_company_id=hubspot_id,
+                processed_at=datetime.now().isoformat(),
+                processing_time_seconds=processing_time,
+                success=False,
+                error_message=str(e)
+            )
+    
+    def process_all_individual(self, companies: list, job_id: str):
+        """Process all companies individually with smart resume"""
+        
+        # Filter out already processed companies
+        unprocessed = self.get_unprocessed_companies(companies)
+        
+        if not unprocessed:
+            logger.info("No unprocessed companies found. All done!")
+            with job_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['message'] = 'All companies already processed'
+            return
+        
+        logger.info(f"Starting individual processing of {len(unprocessed)} companies...")
+        
+        with job_lock:
+            jobs[job_id]['status'] = 'processing'
+            jobs[job_id]['total_unprocessed'] = len(unprocessed)
+            jobs[job_id]['started_at'] = datetime.now().isoformat()
+        
+        start_time = time.time()
+        
+        for i, company in enumerate(unprocessed, 1):
+            slug = company.get('slug', 'unknown')
+            
+            try:
+                logger.info(f"[{job_id}] [{i}/{len(unprocessed)}] Processing company {slug}...")
+                
+                # Process individual company
+                result = self.process_single_company(company)
+                
+                # Save result immediately (persistent)
+                self._append_result(result)
+                self._append_processed_slug(slug)
+                
+                # Update counters
+                self.total_processed += 1
+                if result.success:
+                    self.total_successful += 1
+                    logger.info(f"[{job_id}] ✅ SUCCESS: {slug} - {result.sales_bd_count} sales/BD ({result.processing_time_seconds:.2f}s)")
+                else:
+                    self.total_failed += 1
+                    logger.warning(f"[{job_id}] ❌ FAILED: {slug} - {result.error_message}")
+                
+                # Update job status
+                with job_lock:
+                    jobs[job_id]['processed_count'] = i
+                    jobs[job_id]['total_successful'] = self.total_successful
+                    jobs[job_id]['total_failed'] = self.total_failed
+                    jobs[job_id]['current_company'] = slug
+                
+                # Save progress every 10 companies
+                if i % 10 == 0:
+                    self._save_progress()
+                    elapsed = time.time() - start_time
+                    rate = i / elapsed * 60  # companies per minute
+                    logger.info(f"[{job_id}] Progress: {i}/{len(unprocessed)} ({i/len(unprocessed)*100:.1f}%) - Rate: {rate:.1f} companies/min")
+                
+                # Brief pause to be nice to the database
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"[{job_id}] Unexpected error processing {slug}: {e}")
+                self.total_failed += 1
+                continue
+        
+        # Generate final CSV
+        self._generate_final_csv()
+        
+        # Final save
+        self._save_progress()
+        
+        elapsed = time.time() - start_time
+        with job_lock:
+            jobs[job_id]['status'] = 'completed'
+            jobs[job_id]['completed_at'] = datetime.now().isoformat()
+            jobs[job_id]['final_csv'] = self.final_csv_file.name
+            jobs[job_id]['processing_time_seconds'] = elapsed
+        
+        logger.info(f"[{job_id}] 🎉 Individual processing complete!")
+        logger.info(f"[{job_id}] 📊 Stats: {self.total_successful} successful, {self.total_failed} failed, {elapsed:.1f}s total")
+    
+    def _generate_final_csv(self):
+        """Generate final CSV from JSONL results"""
+        try:
+            if not self.results_file.exists():
+                return
+            
+            results = []
+            with open(self.results_file, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        result = json.loads(line.strip())
+                        if result.get('success', False):
+                            results.append({
+                                'slug': result['company_slug'],
+                                'hubspot_company_id': result.get('hubspot_company_id', ''),
+                                'sales_bd_count': result.get('sales_bd_count', 0)
+                            })
+            
+            if results:
+                with open(self.final_csv_file, 'w', newline='') as csvfile:
+                    fieldnames = ['slug', 'hubspot_company_id', 'sales_bd_count']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(results)
+                
+                logger.info(f"Generated final CSV with {len(results)} successful results: {self.final_csv_file.name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate final CSV: {e}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current processing statistics"""
+        return {
+            'total_processed': self.total_processed,
+            'total_successful': self.total_successful,
+            'total_failed': self.total_failed,
+            'processed_slugs_count': len(self.processed_slugs),
+            'results_file_exists': self.results_file.exists(),
+            'results_file_size_mb': self.results_file.stat().st_size / 1024 / 1024 if self.results_file.exists() else 0,
+            'final_csv_exists': self.final_csv_file.exists(),
+            'final_csv_size_mb': self.final_csv_file.stat().st_size / 1024 / 1024 if self.final_csv_file.exists() else 0
+        }
+
+# Global processor instance
+processor = SmartSalesBDProcessor()
 
 def setup_ssl_files():
     """Setup SSL certificate files from environment variables"""
@@ -104,15 +453,10 @@ FROM (
 GROUP BY slug;
 """
 
-def process_companies_background(job_id, companies, batch_size, input_format):
-    """Background processing function with better error handling"""
-    conn = None
+def process_companies_individual(job_id, companies, input_format):
+    """Individual processing function with smart resume and deduplication"""
     try:
-        with job_lock:
-            jobs[job_id]['status'] = 'processing'
-            jobs[job_id]['started_at'] = datetime.now().isoformat()
-        
-        print(f"[JOB {job_id}] START: Processing {len(companies)} companies in background", flush=True)
+        print(f"[JOB {job_id}] START: Individual processing of {len(companies)} companies", flush=True)
         sys.stdout.flush()
         
         # Test database connection first
@@ -125,175 +469,31 @@ def process_companies_background(job_id, companies, batch_size, input_format):
         cursor.execute("SELECT 1")
         result = cursor.fetchone()
         conn.close()
-        conn = None
         
         print(f"[JOB {job_id}] Database connection successful", flush=True)
         sys.stdout.flush()
         
-        # Create timestamped filename
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        final_filename = f'sales_bd_results_{timestamp}.csv'
-        partial_filename = f'sales_bd_partial_{timestamp}.csv'
+        # Set database config for processor
+        processor.db_config = db_config
         
-        # Ensure data directory exists
-        data_dir = '/data'
-        if not os.path.exists(data_dir):
-            os.makedirs(data_dir)
+        # Convert companies to proper format
+        formatted_companies = []
+        for company in companies:
+            if input_format == 'csv':
+                formatted_companies.append({
+                    'slug': company['slug'],
+                    'hubspot_company_id': company['hubspot_company_id']
+                })
+            else:
+                formatted_companies.append({
+                    'slug': company,
+                    'hubspot_company_id': ''
+                })
         
-        final_filepath = os.path.join(data_dir, final_filename)
-        partial_filepath = os.path.join(data_dir, partial_filename)
+        # Process all companies individually
+        processor.process_all_individual(formatted_companies, job_id)
         
-        all_results = []
-        
-        # Create lookup dict for HubSpot IDs if provided
-        slug_to_hubspot_id = {}
-        if input_format == 'csv':
-            for company in companies:
-                slug_to_hubspot_id[company['slug']] = company['hubspot_company_id']
-        
-        total_batches = (len(companies) + batch_size - 1) // batch_size
-        
-        with job_lock:
-            jobs[job_id]['total_batches'] = total_batches
-            jobs[job_id]['completed_batches'] = 0
-        
-        print(f"[JOB {job_id}] Processing {len(companies)} companies in {total_batches} batches of {batch_size}", flush=True)
-        sys.stdout.flush()
-        
-        # Process in batches
-        for i in range(0, len(companies), batch_size):
-            batch = companies[i:i+batch_size]
-            batch_num = (i // batch_size) + 1
-            
-            print(f"[JOB {job_id}] BATCH {batch_num}/{total_batches}: Processing {len(batch)} companies...", flush=True)
-            sys.stdout.flush()
-            
-            # Format for SQL IN clause - just the slugs
-            slug_list = "'" + "', '".join([company['slug'] for company in batch]) + "'"
-            query = QUERY_TEMPLATE.format(slug_list)
-            
-            # Execute query with timeout
-            batch_results = []
-            try:
-                print(f"[JOB {job_id}] BATCH {batch_num}: Connecting to database...", flush=True)
-                sys.stdout.flush()
-                
-                conn = psycopg2.connect(**db_config)
-                cursor = conn.cursor()
-                
-                print(f"[JOB {job_id}] BATCH {batch_num}: Executing query...", flush=True)
-                sys.stdout.flush()
-                
-                cursor.execute(query)
-                
-                print(f"[JOB {job_id}] BATCH {batch_num}: Fetching results...", flush=True)
-                sys.stdout.flush()
-                
-                # Fetch results manually (no pandas)
-                results = cursor.fetchall()
-                column_names = [desc[0] for desc in cursor.description]
-                
-                print(f"[JOB {job_id}] BATCH {batch_num}: Got {len(results)} raw results", flush=True)
-                sys.stdout.flush()
-                
-                # Convert to list of dicts
-                for row in results:
-                    row_dict = dict(zip(column_names, row))
-                    
-                    # Add HubSpot company ID if provided
-                    if input_format == 'csv':
-                        row_dict['hubspot_company_id'] = slug_to_hubspot_id.get(row_dict['slug'], '')
-                    
-                    batch_results.append(row_dict)
-                
-                all_results.extend(batch_results)
-                conn.close()
-                conn = None
-                
-                print(f"[JOB {job_id}] BATCH {batch_num}: Processed {len(batch_results)} results", flush=True)
-                sys.stdout.flush()
-                
-                # Save partial results after each batch
-                if all_results:
-                    print(f"[JOB {job_id}] BATCH {batch_num}: Saving partial results...", flush=True)
-                    sys.stdout.flush()
-                    
-                    with open(partial_filepath, 'w', newline='') as csvfile:
-                        fieldnames = all_results[0].keys()
-                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                        writer.writeheader()
-                        writer.writerows(all_results)
-                
-                # Update job status
-                with job_lock:
-                    jobs[job_id]['completed_batches'] = batch_num
-                    jobs[job_id]['total_results'] = len(all_results)
-                    jobs[job_id]['partial_file'] = partial_filename
-                
-                print(f"[JOB {job_id}] BATCH {batch_num}/{total_batches}: COMPLETE - {len(batch_results)} new results (Total: {len(all_results)})", flush=True)
-                sys.stdout.flush()
-                
-                # Brief pause to be nice to the database
-                time.sleep(1.0)
-                
-            except Exception as batch_error:
-                if conn:
-                    conn.close()
-                    conn = None
-                
-                error_msg = f"Batch {batch_num} error: {str(batch_error)}"
-                print(f"[JOB {job_id}] BATCH {batch_num}: ERROR - {error_msg}", flush=True)
-                print(f"[JOB {job_id}] BATCH {batch_num}: Traceback - {traceback.format_exc()}", flush=True)
-                sys.stdout.flush()
-                
-                with job_lock:
-                    if 'batch_errors' not in jobs[job_id]:
-                        jobs[job_id]['batch_errors'] = []
-                    jobs[job_id]['batch_errors'].append(error_msg)
-                
-                # Continue with next batch instead of failing entire job
-                continue
-        
-        # Save final results
-        if all_results:
-            print(f"[JOB {job_id}] Saving final results to {final_filename}...", flush=True)
-            sys.stdout.flush()
-            
-            # Write final CSV
-            with open(final_filepath, 'w', newline='') as csvfile:
-                fieldnames = all_results[0].keys()
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(all_results)
-            
-            # Remove partial file since we have final results
-            if os.path.exists(partial_filepath):
-                os.remove(partial_filepath)
-            
-            # Update job status
-            with job_lock:
-                jobs[job_id]['status'] = 'completed'
-                jobs[job_id]['completed_at'] = datetime.now().isoformat()
-                jobs[job_id]['final_file'] = final_filename
-                jobs[job_id]['total_results'] = len(all_results)
-                if 'partial_file' in jobs[job_id]:
-                    del jobs[job_id]['partial_file']
-            
-            print(f"[JOB {job_id}] COMPLETE: {len(all_results)} companies with Sales/BD employees. Saved to {final_filename}", flush=True)
-            sys.stdout.flush()
-        else:
-            with job_lock:
-                jobs[job_id]['status'] = 'completed'
-                jobs[job_id]['completed_at'] = datetime.now().isoformat()
-                jobs[job_id]['error'] = 'No results found'
-            
-            print(f"[JOB {job_id}] COMPLETE: No companies found with Sales/BD employees", flush=True)
-            sys.stdout.flush()
-            
     except Exception as e:
-        if conn:
-            conn.close()
-        
         error_msg = str(e)
         traceback_msg = traceback.format_exc()
         
@@ -329,8 +529,11 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h1>Sales/BD Employee Counter</h1>
-    <p>Process companies in batches to count Sales and Business Development employees.</p>
+    <h1>🚀 Smart Sales/BD Employee Counter</h1>
+    <p>Process companies <strong>individually</strong> with smart resume and persistent deduplication.</p>
+    <div style="background: #d4edda; padding: 10px; border-radius: 4px; margin: 10px 0;">
+        <strong>✅ New Features:</strong> Individual processing, fault tolerance, smart resume, query timeouts, persistent deduplication
+    </div>
     
     <div class="section">
         <h3>Start New Job</h3>
@@ -615,18 +818,20 @@ def test_connection():
 
 @app.route('/start-job', methods=['POST'])
 def start_job():
-    """Start a background processing job"""
+    """Start an individual processing job with smart resume"""
     try:
         data = request.json
         companies = data['companies']
-        batch_size = data.get('batch_size', 100)  # Reduced default
         input_format = data.get('input_format', 'slugs')
         
         # Generate unique job ID
         job_id = str(uuid.uuid4())
         
-        print(f"[API] Starting job {job_id} for {len(companies)} companies", flush=True)
+        print(f"[API] Starting INDIVIDUAL job {job_id} for {len(companies)} companies", flush=True)
         sys.stdout.flush()
+        
+        # Get processor stats for context
+        stats = processor.get_stats()
         
         # Store job info
         with job_lock:
@@ -635,14 +840,15 @@ def start_job():
                 'status': 'queued',
                 'created_at': datetime.now().isoformat(),
                 'total_companies': len(companies),
-                'batch_size': batch_size,
-                'input_format': input_format
+                'input_format': input_format,
+                'processing_mode': 'individual',
+                'previous_stats': stats
             }
         
-        # Start background thread
+        # Start background thread with individual processing
         thread = threading.Thread(
-            target=process_companies_background,
-            args=(job_id, companies, batch_size, input_format)
+            target=process_companies_individual,
+            args=(job_id, companies, input_format)
         )
         thread.daemon = True
         thread.start()
@@ -650,7 +856,10 @@ def start_job():
         return jsonify({
             'success': True,
             'job_id': job_id,
-            'message': f'Job started processing {len(companies)} companies in background'
+            'message': f'Individual processing job started for {len(companies)} companies',
+            'processing_mode': 'individual',
+            'smart_resume': True,
+            'previous_processed': stats['total_processed']
         })
         
     except Exception as e:
@@ -660,7 +869,7 @@ def start_job():
 
 @app.route('/status')
 def get_status():
-    """Get status of all jobs"""
+    """Get status of all jobs and processor statistics"""
     try:
         with job_lock:
             job_list = list(jobs.values())
@@ -668,9 +877,15 @@ def get_status():
         # Sort by creation time, newest first
         job_list.sort(key=lambda x: x['created_at'], reverse=True)
         
+        # Get processor statistics
+        processor_stats = processor.get_stats()
+        
         return jsonify({
             'api_success': True,
-            'jobs': job_list
+            'jobs': job_list,
+            'processor_stats': processor_stats,
+            'processing_mode': 'individual_with_smart_resume',
+            'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
         return jsonify({'api_success': False, 'error': str(e), 'jobs': []})
