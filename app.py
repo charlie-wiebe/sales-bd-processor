@@ -1399,6 +1399,7 @@ HTML_TEMPLATE = """
         <button onclick="checkStatus()">Refresh Status</button>
         <button onclick="listFiles()">List All CSV Files</button>
         <button onclick="downloadLatest()">Download Latest CSV</button>
+        <button onclick="downloadCurrent()">Download Current Results</button>
         <button onclick="testConnection()">Test DB Connection</button>
         <div id="jobStatus">Click "Refresh Status" to check current jobs</div>
         <div id="fileList"></div>
@@ -1483,8 +1484,8 @@ HTML_TEMPLATE = """
                                     <br><a href="/download-csv/${job.final_file}" download>Download Final CSV</a>`;
                             }
                             
-                            if (job.status === 'processing' && job.partial_file) {
-                                statusHtml += `<br><a href="/download-csv/${job.partial_file}" download>Download Partial Results</a>`;
+                            if (job.status === 'processing') {
+                                statusHtml += `<br><a href="/download-current-results" download>Download Current Results</a>`;
                             }
                             
                             if (job.error) {
@@ -1509,6 +1510,10 @@ HTML_TEMPLATE = """
 
         function downloadLatest() {
             window.open('/download-latest', '_blank');
+        }
+        
+        function downloadCurrent() {
+            window.open('/download-current-results', '_blank');
         }
         
         document.getElementById('jobForm').addEventListener('submit', async (e) => {
@@ -1751,8 +1756,9 @@ def download_latest():
     try:
         data_dir = '/data'
         if not os.path.exists(data_dir):
-            return 'No files found', 404
+            return 'No data directory found', 404
         
+        # Get all CSV files
         csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
         if not csv_files:
             return 'No CSV files found', 404
@@ -1764,6 +1770,57 @@ def download_latest():
         
     except Exception as e:
         return f'Error: {e}', 500
+
+@app.route('/download-current-results')
+def download_current_results():
+    """Download current results from the active results file"""
+    try:
+        # Try to get current results from the processor's results file
+        results_file = processor.results_file
+        
+        if not results_file.exists():
+            return 'No results file found', 404
+        
+        # Generate CSV from current JSONL results
+        results = []
+        with open(results_file, 'r') as f:
+            for line in f:
+                try:
+                    result = json.loads(line)
+                    if result.get('success', False):
+                        results.append({
+                            'slug': result['company_slug'],
+                            'hubspot_company_id': result.get('hubspot_company_id', ''),
+                            'sales_bd_count': result.get('sales_bd_count', 0),
+                            'sdr_bdr_count': result.get('sdr_bdr_count', 0)
+                        })
+                except json.JSONDecodeError:
+                    continue  # Skip malformed lines
+        
+        if not results:
+            return 'No successful results found', 404
+        
+        # Create CSV in memory
+        output = io.StringIO()
+        fieldnames = ['slug', 'hubspot_company_id', 'sales_bd_count', 'sdr_bdr_count']
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+        
+        # Create response
+        csv_content = output.getvalue()
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'current_results_{timestamp}.csv'
+        
+        response = app.response_class(
+            csv_content,
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename={filename}'}
+        )
+        return response
+        
+    except Exception as e:
+        return f'Error generating current results: {e}', 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
