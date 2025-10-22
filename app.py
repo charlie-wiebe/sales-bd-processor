@@ -1428,6 +1428,49 @@ def start_job():
 #     Now using master query in /start-job endpoint for both metrics"""
 #     pass
 
+@app.route('/clear-processed-slugs', methods=['POST'])
+def clear_processed_slugs():
+    """Clear processed slugs to allow reprocessing companies (use with caution!)"""
+    try:
+        data = request.get_json() or {}
+        confirm = data.get('confirm', False)
+        
+        if not confirm:
+            return jsonify({
+                'success': False, 
+                'error': 'Must set confirm=true to clear processed slugs',
+                'current_count': len(processor.processed_slugs)
+            })
+        
+        # Clear in-memory cache
+        old_count = len(processor.processed_slugs)
+        processor.processed_slugs.clear()
+        
+        # Clear file on disk
+        if processor.processed_slugs_file.exists():
+            processor.processed_slugs_file.unlink()
+            
+        # Reset counters
+        processor.total_processed = 0
+        processor.total_successful = 0
+        processor.total_failed = 0
+        
+        # Save progress
+        processor._save_progress()
+        
+        logger.info(f"✅ Cleared {old_count} processed slugs - ready for reprocessing")
+        
+        return jsonify({
+            'success': True,
+            'message': f'Cleared {old_count} processed slugs',
+            'old_count': old_count,
+            'new_count': len(processor.processed_slugs)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error clearing processed slugs: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
 @app.route('/start-async-job', methods=['POST'])
 def start_async_job():
     """Start an async batch processing job (conservative concurrency)"""
