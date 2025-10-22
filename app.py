@@ -219,13 +219,9 @@ class SmartSalesBDProcessor:
                 # Set query timeout
                 cursor.execute("SET statement_timeout = '60s'")  # Longer timeout for master query
                 
-                # Prepare statement if not already prepared (prepared statements are per-connection)
-                cursor.execute("DEALLOCATE ALL")  # Clear any existing prepared statements
-                prepare_query = "PREPARE master_single_query (text) AS " + MASTER_QUERY_TEMPLATE.replace("{}", "$1")
-                cursor.execute(prepare_query)
-                
-                # Execute prepared statement
-                cursor.execute("EXECUTE master_single_query (%s)", (slug,))
+                # Use the master query template for single company (REVERT TO WORKING VERSION)
+                query = MASTER_QUERY_TEMPLATE.format(f"'{slug}'")
+                cursor.execute(query)
                 
                 result = cursor.fetchone()
             finally:
@@ -316,13 +312,9 @@ class SmartSalesBDProcessor:
                 timeout = min(300, 30 + (len(companies) * 5))  # 30s base + 5s per company, max 5 minutes
                 cursor.execute(f"SET statement_timeout = '{timeout}s'")
                 
-                # Prepare statement for batch query (prepared statements are per-connection)
-                cursor.execute("DEALLOCATE ALL")  # Clear any existing prepared statements
-                prepare_query = "PREPARE master_batch_query (text) AS " + MASTER_QUERY_TEMPLATE.replace("{}", "$1")
-                cursor.execute(prepare_query)
-                
-                # Execute prepared statement  
-                cursor.execute("EXECUTE master_batch_query (%s)", (slug_list,))
+                # Always use master query for both metrics (REVERT TO WORKING VERSION)
+                query = MASTER_QUERY_TEMPLATE.format(f"'{slug_list}'")
+                cursor.execute(query)
                 query_results = cursor.fetchall()
             finally:
                 return_pooled_connection(conn)
