@@ -225,7 +225,7 @@ class SmartSalesBDProcessor:
                 cursor.execute(prepare_query)
                 
                 # Execute prepared statement
-                cursor.execute("EXECUTE master_single_query (%s)", (f"'{slug}'",))
+                cursor.execute("EXECUTE master_single_query (%s)", (slug,))
                 
                 result = cursor.fetchone()
             finally:
@@ -321,8 +321,8 @@ class SmartSalesBDProcessor:
                 prepare_query = "PREPARE master_batch_query (text) AS " + MASTER_QUERY_TEMPLATE.replace("{}", "$1")
                 cursor.execute(prepare_query)
                 
-                # Execute prepared statement
-                cursor.execute("EXECUTE master_batch_query (%s)", (f"'{slug_list}'",))
+                # Execute prepared statement  
+                cursor.execute("EXECUTE master_batch_query (%s)", (slug_list,))
                 query_results = cursor.fetchall()
             finally:
                 return_pooled_connection(conn)
