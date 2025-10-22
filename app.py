@@ -1246,9 +1246,16 @@ HTML_TEMPLATE = """
                 companies = inputData.split('\\n').filter(line => line.trim()).map(slug => ({slug: slug.trim()}));
             } else {
                 companies = inputData.split('\\n').filter(line => line.trim()).map(line => {
-                    const [hubspot_id, slug] = line.split(',').map(s => s.trim());
-                    return {hubspot_company_id: hubspot_id, slug: slug};
-                });
+                    const parts = line.split(',');
+                    if (parts.length >= 2) {
+                        const hubspot_id = parts[0].trim();
+                        const slug = parts[1].trim();
+                        return {hubspot_company_id: hubspot_id, slug: slug};
+                    } else {
+                        console.error('Invalid CSV line:', line);
+                        return null;
+                    }
+                }).filter(company => company !== null);
             }
             
             if (companies.length === 0) {
@@ -1371,6 +1378,8 @@ def start_job():
         job_id = str(uuid.uuid4())
         
         print(f"[API] Starting INDIVIDUAL job {job_id} for {len(companies)} companies", flush=True)
+        print(f"[API] Input format: {input_format}", flush=True)
+        print(f"[API] First 3 companies: {companies[:3]}", flush=True)
         sys.stdout.flush()
         
         # Get processor stats for context
