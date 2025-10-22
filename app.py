@@ -217,7 +217,7 @@ class SmartSalesBDProcessor:
             
             try:
                 # Set query timeout
-                cursor.execute("SET statement_timeout = '60s'")  # Longer timeout for master query
+                cursor.execute("SET statement_timeout = '180s'")  # Longer timeout for large companies
                 
                 # Use the master query template for single company (REVERT TO WORKING VERSION)
                 query = MASTER_QUERY_TEMPLATE.format(f"'{slug}'")
@@ -309,7 +309,7 @@ class SmartSalesBDProcessor:
             
             try:
                 # Set query timeout based on batch size
-                timeout = min(300, 30 + (len(companies) * 5))  # 30s base + 5s per company, max 5 minutes
+                timeout = min(300, 180)  # 180s base timeout, max 5 minutes
                 cursor.execute(f"SET statement_timeout = '{timeout}s'")
                 
                 # Always use master query for both metrics (REVERT TO WORKING VERSION)
