@@ -6,6 +6,7 @@ Processes companies one at a time with fault tolerance and resume capability
 
 import os
 import psycopg2
+import psycopg2.pool
 import time
 from flask import Flask, request, jsonify, render_template_string
 from typing import List, Dict, Any, Optional
@@ -25,6 +26,8 @@ from pathlib import Path
 import fcntl
 import shutil
 from dataclasses import dataclass, asdict
+import asyncio
+import concurrent.futures
 
 # Configure logging
 logging.basicConfig(
@@ -38,6 +41,10 @@ app = Flask(__name__)
 # Global job storage
 jobs = {}
 job_lock = threading.Lock()
+
+# Global connection pool - Conservative settings to minimize DB stress
+connection_pool = None
+pool_lock = threading.Lock()
 
 @dataclass
 class ProcessingResult:
@@ -190,19 +197,25 @@ class SmartSalesBDProcessor:
         try:
             logger.debug(f"Processing company {slug} with master query")
             
-            # Execute the master query for this single company
-            conn = psycopg2.connect(**self.db_config)
+            # Execute the master query for this single company using connection pool
+            conn = get_pooled_connection()
             cursor = conn.cursor()
             
-            # Set query timeout
-            cursor.execute("SET statement_timeout = '60s'")  # Longer timeout for master query
-            
-            # Use the master query template for single company
-            query = MASTER_QUERY_TEMPLATE.format(f"'{slug}'")
-            cursor.execute(query)
-            
-            result = cursor.fetchone()
-            conn.close()
+            try:
+                # Set query timeout
+                cursor.execute("SET statement_timeout = '60s'")  # Longer timeout for master query
+                
+                # Prepare statement if not already prepared (prepared statements are per-connection)
+                cursor.execute("DEALLOCATE ALL")  # Clear any existing prepared statements
+                prepare_query = "PREPARE master_single_query (text) AS " + MASTER_QUERY_TEMPLATE.replace("{}", "$1")
+                cursor.execute(prepare_query)
+                
+                # Execute prepared statement
+                cursor.execute("EXECUTE master_single_query (%s)", (f"'{slug}'",))
+                
+                result = cursor.fetchone()
+            finally:
+                return_pooled_connection(conn)
             
             processing_time = time.time() - start_time
             
@@ -281,18 +294,24 @@ class SmartSalesBDProcessor:
         try:
             logger.debug(f"Processing batch of {len(companies)} companies")
             
-            conn = psycopg2.connect(**self.db_config)
+            conn = get_pooled_connection()
             cursor = conn.cursor()
             
-            # Set query timeout based on batch size
-            timeout = min(300, 30 + (len(companies) * 5))  # 30s base + 5s per company, max 5 minutes
-            cursor.execute(f"SET statement_timeout = '{timeout}s'")
-            
-            # Always use master query for both metrics
-            query = MASTER_QUERY_TEMPLATE.format(f"'{slug_list}'")
-            cursor.execute(query)
-            query_results = cursor.fetchall()
-            conn.close()
+            try:
+                # Set query timeout based on batch size
+                timeout = min(300, 30 + (len(companies) * 5))  # 30s base + 5s per company, max 5 minutes
+                cursor.execute(f"SET statement_timeout = '{timeout}s'")
+                
+                # Prepare statement for batch query (prepared statements are per-connection)
+                cursor.execute("DEALLOCATE ALL")  # Clear any existing prepared statements
+                prepare_query = "PREPARE master_batch_query (text) AS " + MASTER_QUERY_TEMPLATE.replace("{}", "$1")
+                cursor.execute(prepare_query)
+                
+                # Execute prepared statement
+                cursor.execute("EXECUTE master_batch_query (%s)", (f"'{slug_list}'",))
+                query_results = cursor.fetchall()
+            finally:
+                return_pooled_connection(conn)
             
             processing_time = time.time() - start_time
             
@@ -506,6 +525,114 @@ class SmartSalesBDProcessor:
             'final_csv_exists': self.final_csv_file.exists(),
             'final_csv_size_mb': self.final_csv_file.stat().st_size / 1024 / 1024 if self.final_csv_file.exists() else 0
         }
+    
+    def process_all_with_async_batch(self, companies: list, job_id: str, batch_size: int = 10, max_concurrent: int = 2):
+        """Process all companies with conservative async batch processing (max 2-3 concurrent batches)"""
+        
+        # Filter out already processed companies
+        unprocessed = [c for c in companies if c.get('slug', '') not in self.processed_slugs]
+        
+        if not unprocessed:
+            with job_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['message'] = 'All companies already processed'
+            return
+        
+        processing_mode = f"async batch (size {batch_size}, max {max_concurrent} concurrent)"
+        logger.info(f"Starting {processing_mode} processing of {len(unprocessed)} companies...")
+        
+        with job_lock:
+            jobs[job_id]['status'] = 'processing'
+            jobs[job_id]['total_unprocessed'] = len(unprocessed)
+            jobs[job_id]['batch_size'] = batch_size
+            jobs[job_id]['max_concurrent'] = max_concurrent
+            jobs[job_id]['started_at'] = datetime.now().isoformat()
+        
+        start_time = time.time()
+        
+        # Create batches
+        batches = []
+        for i in range(0, len(unprocessed), batch_size):
+            batch = unprocessed[i:i + batch_size]
+            batches.append(batch)
+        
+        logger.info(f"[{job_id}] Created {len(batches)} batches for async processing")
+        
+        # Process batches with conservative concurrency
+        def process_batch_sync(batch_data):
+            """Synchronous wrapper for batch processing"""
+            batch, batch_num = batch_data
+            try:
+                slugs = [c.get('slug', 'unknown') for c in batch]
+                logger.info(f"[{job_id}] [Async Batch {batch_num}/{len(batches)}] Processing {len(batch)} companies: {', '.join(slugs[:3])}{'...' if len(batch) > 3 else ''}")
+                
+                # Process batch using existing method
+                batch_results = self.process_companies_batch(batch, batch_size=len(batch))
+                
+                # Save results and update counters
+                for result in batch_results:
+                    self._save_result(result)
+                    if result.success:
+                        self.total_successful += 1
+                        self.processed_slugs.add(result.company_slug)
+                    else:
+                        self.total_failed += 1
+                
+                self.total_processed += len(batch)
+                self._save_progress()
+                
+                # Update job status
+                with job_lock:
+                    jobs[job_id]['processed_count'] = self.total_processed
+                    jobs[job_id]['total_successful'] = self.total_successful
+                    jobs[job_id]['total_failed'] = self.total_failed
+                    jobs[job_id]['current_batch'] = f"Async Batch {batch_num}/{len(batches)}"
+                
+                # Conservative delay between batches to be nice to DB
+                time.sleep(0.2)
+                
+                return len([r for r in batch_results if r.success])
+                
+            except Exception as e:
+                batch_slugs = [c.get('slug', 'unknown') for c in batch]
+                logger.error(f"[{job_id}] Async batch error {batch_slugs}: {e}")
+                self.total_failed += len(batch)
+                return 0
+        
+        # Use ThreadPoolExecutor for conservative concurrency
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            # Submit all batches with batch numbers
+            batch_data = [(batch, i+1) for i, batch in enumerate(batches)]
+            
+            # Process batches concurrently but conservatively
+            futures = [executor.submit(process_batch_sync, bd) for bd in batch_data]
+            
+            # Wait for all to complete
+            successful_batches = 0
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    if result > 0:
+                        successful_batches += 1
+                except Exception as e:
+                    logger.error(f"[{job_id}] Future execution error: {e}")
+        
+        # Generate final CSV
+        self._generate_final_csv()
+        
+        # Final save
+        self._save_progress()
+        
+        elapsed = time.time() - start_time
+        with job_lock:
+            jobs[job_id]['status'] = 'completed'
+            jobs[job_id]['completed_at'] = datetime.now().isoformat()
+            jobs[job_id]['final_csv'] = self.final_csv_file.name
+            jobs[job_id]['processing_time_seconds'] = elapsed
+        
+        logger.info(f"[{job_id}] 🎉 Async batch processing complete!")
+        logger.info(f"[{job_id}] 📊 Stats: {self.total_successful} successful, {self.total_failed} failed, {elapsed:.1f}s total")
+        logger.info(f"[{job_id}] 🚀 Processed {len(batches)} batches with max {max_concurrent} concurrent")
 
 # Global processor instance
 processor = SmartSalesBDProcessor()
@@ -554,6 +681,71 @@ def get_db_config():
         config.update(ssl_files)
     
     return config
+
+
+def get_connection_pool():
+    """Get or create connection pool with conservative settings"""
+    global connection_pool
+    
+    with pool_lock:
+        if connection_pool is None:
+            try:
+                db_config = get_db_config()
+                # Conservative pool settings to minimize DB stress
+                connection_pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=2,      # Minimum 2 connections
+                    maxconn=5,      # Maximum 5 connections (very conservative)
+                    **db_config
+                )
+                logger.info("✅ Connection pool created (2-5 connections)")
+            except Exception as e:
+                logger.error(f"❌ Failed to create connection pool: {e}")
+                raise
+        
+        return connection_pool
+
+
+def get_pooled_connection():
+    """Get a connection from the pool"""
+    try:
+        pool = get_connection_pool()
+        conn = pool.getconn()
+        if conn:
+            return conn
+        else:
+            raise Exception("No connections available in pool")
+    except Exception as e:
+        logger.error(f"❌ Failed to get pooled connection: {e}")
+        # Fallback to direct connection
+        return psycopg2.connect(**get_db_config())
+
+
+def return_pooled_connection(conn):
+    """Return a connection to the pool"""
+    try:
+        if connection_pool and conn:
+            connection_pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"❌ Failed to return connection to pool: {e}")
+        # If pool return fails, just close the connection
+        try:
+            conn.close()
+        except:
+            pass
+
+
+def close_connection_pool():
+    """Close all connections in the pool"""
+    global connection_pool
+    
+    with pool_lock:
+        if connection_pool:
+            try:
+                connection_pool.closeall()
+                connection_pool = None
+                logger.info("✅ Connection pool closed")
+            except Exception as e:
+                logger.error(f"❌ Error closing connection pool: {e}")
 
 
 # Master Query Template - Gets both metrics in one shot for maximum efficiency
@@ -789,18 +981,17 @@ def process_companies_individual(job_id, companies, input_format, batch_size=1):
         print(f"[JOB {job_id}] Testing database connection...", flush=True)
         sys.stdout.flush()
         
-        db_config = get_db_config()
-        conn = psycopg2.connect(**db_config)
+        conn = get_pooled_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT 1")
         result = cursor.fetchone()
-        conn.close()
+        return_pooled_connection(conn)
         
         print(f"[JOB {job_id}] Database connection successful", flush=True)
         sys.stdout.flush()
         
         # Set database config for processor
-        processor.db_config = db_config
+        processor.db_config = get_db_config()
         
         # Convert companies to proper format
         formatted_companies = []
@@ -1145,12 +1336,11 @@ def test_connection():
         print("[TEST] Testing database connection...", flush=True)
         sys.stdout.flush()
         
-        db_config = get_db_config()
-        conn = psycopg2.connect(**db_config)
+        conn = get_pooled_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT 1")
         result = cursor.fetchone()
-        conn.close()
+        return_pooled_connection(conn)
         
         print("[TEST] Database connection successful", flush=True)
         sys.stdout.flush()
@@ -1223,6 +1413,65 @@ def start_job():
 #     """DEPRECATED: Start an individual SDR processing job with smart resume
 #     Now using master query in /start-job endpoint for both metrics"""
 #     pass
+
+@app.route('/start-async-job', methods=['POST'])
+def start_async_job():
+    """Start an async batch processing job (conservative concurrency)"""
+    try:
+        data = request.get_json()
+        companies = data.get('companies', [])
+        input_format = data.get('input_format', 'json')
+        
+        if not companies:
+            return jsonify({'success': False, 'error': 'No companies provided'})
+        
+        job_id = str(uuid.uuid4())
+        
+        # Get current stats
+        stats = processor.get_stats()
+        
+        with job_lock:
+            jobs[job_id] = {
+                'status': 'initializing',
+                'created_at': datetime.now().isoformat(),
+                'total_companies': len(companies),
+                'input_format': input_format,
+                'processing_mode': 'async_batch',
+                'previous_stats': stats
+            }
+        
+        # Get batch size and concurrency from request (with conservative defaults)
+        batch_size = int(data.get('batch_size', 10))  # Default 10
+        max_concurrent = min(int(data.get('max_concurrent', 2)), 3)  # Max 3, default 2
+        
+        # Start background thread with async processing
+        def run_async_processing():
+            try:
+                processor.process_all_with_async_batch(companies, job_id, batch_size, max_concurrent)
+            except Exception as e:
+                logger.error(f"[{job_id}] Async processing error: {e}")
+                with job_lock:
+                    jobs[job_id]['status'] = 'error'
+                    jobs[job_id]['error'] = str(e)
+        
+        thread = threading.Thread(target=run_async_processing)
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'message': f'Async batch processing job started for {len(companies)} companies',
+            'processing_mode': 'async_batch',
+            'batch_size': batch_size,
+            'max_concurrent': max_concurrent,
+            'smart_resume': True,
+            'previous_processed': stats['total_processed']
+        })
+        
+    except Exception as e:
+        logger.error(f"[API] Error starting async job: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/status')
 def get_status():
@@ -1337,6 +1586,19 @@ def download_current_results():
     except Exception as e:
         return f'Error generating current results: {e}', 500
 
+@app.teardown_appcontext
+def cleanup_connection_pool(exception):
+    """Clean up connection pool on app teardown"""
+    pass  # Connection pool cleanup handled by close_connection_pool()
+
+import atexit
+# Register cleanup function to run on app shutdown
+atexit.register(close_connection_pool)
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    try:
+        app.run(host='0.0.0.0', port=port, debug=False)
+    finally:
+        # Ensure connection pool is closed on shutdown
+        close_connection_pool()
