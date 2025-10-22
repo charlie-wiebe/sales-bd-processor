@@ -174,16 +174,30 @@ class SmartSalesBDProcessor:
     
     def is_already_processed(self, slug: str) -> bool:
         """Check if company has already been processed"""
-        return slug in self.processed_slugs
+        try:
+            # Ensure slug is a string and not empty
+            if not isinstance(slug, str) or not slug:
+                return False
+            return slug in self.processed_slugs
+        except Exception as e:
+            logger.error(f"Error checking if slug '{slug}' (type: {type(slug)}) is processed: {e}")
+            return False
     
     def get_unprocessed_companies(self, all_companies: list) -> list:
         """Filter out already processed companies"""
         unprocessed = []
         for company in all_companies:
-            slug = company.get('slug', '')
-            if not self.is_already_processed(slug):
+            # Handle both dict and string inputs safely
+            if isinstance(company, dict):
+                slug = company.get('slug', '')
+            elif isinstance(company, str):
+                slug = company
+            else:
+                logger.warning(f"Unexpected company type: {type(company)}, skipping")
+                continue
+                
+            if slug and not self.is_already_processed(slug):
                 unprocessed.append(company)
-        
         logger.info(f"Found {len(unprocessed)} unprocessed companies out of {len(all_companies)} total")
         return unprocessed
     
